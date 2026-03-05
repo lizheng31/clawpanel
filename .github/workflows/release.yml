@@ -161,9 +161,9 @@ jobs:
           get_logs() {
             local prefix="$1"
             if [ -n "$RANGE" ]; then
-              git log "$RANGE" --pretty=format:"%s" --no-merges | grep -iE "^${prefix}" | sed "s/^${prefix}[:(] */- /" | head -20
+              git log "$RANGE" --pretty=format:"%s" --no-merges | { grep -iE "^${prefix}" || true; } | sed "s/^${prefix}[:(] */- /" | head -20
             else
-              git log --pretty=format:"%s" --no-merges -30 | grep -iE "^${prefix}" | sed "s/^${prefix}[:(] */- /" | head -20
+              git log --pretty=format:"%s" --no-merges -30 | { grep -iE "^${prefix}" || true; } | sed "s/^${prefix}[:(] */- /" | head -20
             fi
           }
 
@@ -171,9 +171,9 @@ jobs:
           FIXES=$(get_logs "fix")
           OTHERS=$(
             if [ -n "$RANGE" ]; then
-              git log "$RANGE" --pretty=format:"%s" --no-merges | grep -ivE "^(feat|fix|style|chore|ci|docs|test|build)" | sed 's/^/- /' | head -10
+              git log "$RANGE" --pretty=format:"%s" --no-merges | { grep -ivE "^(feat|fix|style|chore|ci|docs|test|build)" || true; } | sed 's/^/- /' | head -10
             else
-              git log --pretty=format:"%s" --no-merges -30 | grep -ivE "^(feat|fix|style|chore|ci|docs|test|build)" | sed 's/^/- /' | head -10
+              git log --pretty=format:"%s" --no-merges -30 | { grep -ivE "^(feat|fix|style|chore|ci|docs|test|build)" || true; } | sed 's/^/- /' | head -10
             fi
           )
 

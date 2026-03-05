@@ -43,7 +43,6 @@ pub fn enhanced_path() -> String {
             format!("{}/.nvm/current/bin", home.display()),
             format!("{}/.volta/bin", home.display()),
             format!("{}/.nodenv/shims", home.display()),
-            format!("{}/.fnm/current/bin", home.display()),
             format!("{}/n/bin", home.display()),
         ];
         // 扫描 nvm 实际安装的版本目录（兼容无 current 符号链接的情况）
@@ -52,6 +51,22 @@ pub fn enhanced_path() -> String {
             if let Ok(entries) = std::fs::read_dir(&nvm_versions) {
                 for entry in entries.flatten() {
                     let bin = entry.path().join("bin");
+                    if bin.is_dir() {
+                        extra.push(bin.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+        // fnm: 扫描 $FNM_DIR 或默认 ~/.local/share/fnm 下的版本目录
+        let fnm_dir = std::env::var("FNM_DIR")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/share/fnm"));
+        let fnm_versions = fnm_dir.join("node-versions");
+        if fnm_versions.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&fnm_versions) {
+                for entry in entries.flatten() {
+                    let bin = entry.path().join("installation/bin");
                     if bin.is_dir() {
                         extra.push(bin.to_string_lossy().to_string());
                     }
@@ -79,7 +94,6 @@ pub fn enhanced_path() -> String {
             format!("{}/.nvm/current/bin", home.display()),
             format!("{}/.volta/bin", home.display()),
             format!("{}/.nodenv/shims", home.display()),
-            format!("{}/.fnm/current/bin", home.display()),
             format!("{}/n/bin", home.display()),
         ];
         // NVM_DIR 环境变量（用户可能自定义了 nvm 安装目录）
@@ -92,6 +106,22 @@ pub fn enhanced_path() -> String {
             if let Ok(entries) = std::fs::read_dir(&nvm_versions) {
                 for entry in entries.flatten() {
                     let bin = entry.path().join("bin");
+                    if bin.is_dir() {
+                        extra.push(bin.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+        // fnm: 扫描 $FNM_DIR 或默认 ~/.local/share/fnm 下的版本目录
+        let fnm_dir = std::env::var("FNM_DIR")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/share/fnm"));
+        let fnm_versions = fnm_dir.join("node-versions");
+        if fnm_versions.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&fnm_versions) {
+                for entry in entries.flatten() {
+                    let bin = entry.path().join("installation/bin");
                     if bin.is_dir() {
                         extra.push(bin.to_string_lossy().to_string());
                     }
@@ -165,6 +195,22 @@ pub fn enhanced_path() -> String {
             }
         }
         extra.push(format!(r"{}\.volta\bin", home.display()));
+        // fnm: 扫描 %FNM_DIR% 或默认 %APPDATA%\fnm 下的版本目录
+        let fnm_base = std::env::var("FNM_DIR")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::Path::new(&appdata).join("fnm"));
+        let fnm_versions = fnm_base.join("node-versions");
+        if fnm_versions.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&fnm_versions) {
+                for entry in entries.flatten() {
+                    let inst = entry.path().join("installation");
+                    if inst.is_dir() && inst.join("node.exe").exists() {
+                        extra.push(inst.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
 
         // 扫描常见盘符下的 Node 安装（用户可能装在 D:\、F:\ 等）
         for drive in &["C", "D", "E", "F"] {
