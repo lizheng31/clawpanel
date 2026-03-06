@@ -283,10 +283,13 @@ const handlers = {
       try { cliInstalled = fs.existsSync(path.join(process.env.APPDATA || '', 'npm', 'openclaw.cmd')) }
       catch { cliInstalled = false }
     } else {
-      // Linux
-      cliInstalled = fs.existsSync('/usr/bin/openclaw') ||
-                     fs.existsSync('/usr/local/bin/openclaw') ||
-                     fs.existsSync(path.join(homedir(), '.openclaw/bin/openclaw'))
+      // Linux - 使用 which 命令动态查找
+      try {
+        execSync('which openclaw', { stdio: 'pipe' })
+        cliInstalled = true
+      } catch {
+        cliInstalled = false
+      }
     }
 
     return [{ label, running, pid, description: 'OpenClaw Gateway', cli_installed: cliInstalled }]
