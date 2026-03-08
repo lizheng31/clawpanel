@@ -15,6 +15,23 @@ const NO_MOCK_CMDS = new Set([
   'set_npm_registry', 'reload_gateway', 'restart_gateway',
   'auto_pair_device',
   'assistant_exec', 'assistant_write_file',
+  'docker_create_container', 'docker_start_container', 'docker_stop_container',
+  'docker_restart_container', 'docker_remove_container', 'docker_pull_image',
+  'docker_add_node', 'docker_remove_node',
+  'instance_add', 'instance_remove', 'instance_set_active',
+])
+
+// 仅在 Node.js 后端实现的命令（Tauri Rust 不处理），强制走 webInvoke
+const WEB_ONLY_CMDS = new Set([
+  'docker_test_endpoint',
+  'docker_info', 'docker_list_containers', 'docker_create_container',
+  'docker_start_container', 'docker_stop_container', 'docker_restart_container',
+  'docker_remove_container', 'docker_container_logs', 'docker_pull_image',
+  'docker_list_images', 'docker_list_nodes', 'docker_add_node', 'docker_remove_node',
+  'docker_cluster_overview',
+  'instance_list', 'instance_add', 'instance_remove', 'instance_set_active',
+  'instance_health_check', 'instance_health_all',
+  'get_deploy_mode',
 ])
 
 // 预加载 Tauri invoke，避免每次 API 调用都做动态 import
@@ -79,7 +96,7 @@ export { invalidate }
 
 async function invoke(cmd, args = {}) {
   const start = Date.now()
-  if (_invokeReady) {
+  if (_invokeReady && !WEB_ONLY_CMDS.has(cmd)) {
     const tauriInvoke = await _invokeReady
     const result = await tauriInvoke(cmd, args)
     const duration = Date.now() - start
@@ -113,8 +130,9 @@ async function webInvoke(cmd, args) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(args),
   })
-  if (resp.status === 401 && window.__clawpanel_show_login) {
-    window.__clawpanel_show_login()
+  if (resp.status === 401) {
+    // Tauri 模式下不触发登录浮层（Tauri 有自己的认证流程）
+    if (!isTauri && window.__clawpanel_show_login) window.__clawpanel_show_login()
     throw new Error('需要登录')
   }
   if (!resp.ok) {
@@ -193,7 +211,28 @@ function mockInvoke(cmd, args) {
     write_memory_file: () => true,
     delete_memory_file: () => true,
     export_memory_zip: ({ category }) => `/tmp/openclaw-${category}-20260226-160000.zip`,
-    check_installation: () => ({ installed: true, path: '/usr/local/bin/openclaw', version: '2026.2.23' }),
+    check_installation: () => ({ installed: true, path: '/usr/local/bin/openclaw', version: '2026.2.23', inDocker: false }),
+    get_deploy_mode: () => ({ inDocker: false, dockerAvailable: true, mode: 'local' }),
+    docker_cluster_overview: () => [
+      { id: 'local', name: '本机', type: 'socket', endpoint: '/var/run/docker.sock', online: true, dockerVersion: '27.4.1', os: 'Docker Desktop', cpus: 8, memory: 16 * 1024 * 1024 * 1024, totalContainers: 3, runningContainers: 2, stoppedContainers: 1, containers: [
+        { id: 'a1b2c3d4e5f6', name: 'openclaw', image: 'ghcr.io/qingchencloud/openclaw:latest', state: 'running', status: 'Up 2 hours', ports: '1420→1420, 18789→18789' },
+        { id: 'f6e5d4c3b2a1', name: 'openclaw-gw-2', image: 'ghcr.io/qingchencloud/openclaw:latest-gateway', state: 'running', status: 'Up 5 hours', ports: '18790→18789' },
+        { id: 'b3c4d5e6f7a8', name: 'openclaw-test', image: 'ghcr.io/qingchencloud/openclaw:latest', state: 'exited', status: 'Exited (0) 1 day ago', ports: '' },
+      ]},
+    ],
+    docker_list_containers: () => [
+      { id: 'a1b2c3d4e5f6', name: 'openclaw', image: 'ghcr.io/qingchencloud/openclaw:latest', state: 'running', status: 'Up 2 hours', ports: '1420→1420, 18789→18789', nodeId: 'local', nodeName: '本机' },
+    ],
+    docker_info: () => ({ nodeId: 'local', nodeName: '本机', containers: 3, containersRunning: 2, containersStopped: 1, images: 5, serverVersion: '27.4.1', os: 'Docker Desktop', arch: 'x86_64', cpus: 8, memory: 16 * 1024 * 1024 * 1024 }),
+    docker_list_nodes: () => [{ id: 'local', name: '本机', type: 'socket', endpoint: '/var/run/docker.sock' }],
+    docker_container_logs: () => '[INFO] OpenClaw Gateway started\n[INFO] Listening on :18789\n[INFO] Panel available at :1420',
+    docker_list_images: () => [{ id: 'sha256abcdef', tags: ['ghcr.io/qingchencloud/openclaw:latest'], size: 450 * 1024 * 1024, created: Date.now() / 1000 - 86400 }],
+    instance_list: () => ({ activeId: 'local', instances: [{ id: 'local', name: '本机', type: 'local', endpoint: null, gatewayPort: 18789, addedAt: 0, note: '' }] }),
+    instance_add: () => ({ id: 'remote-mock', name: 'mock' }),
+    instance_remove: () => true,
+    instance_set_active: () => ({ activeId: 'local' }),
+    instance_health_check: () => ({ id: 'local', online: true, version: '2026.3.5', gatewayRunning: true, lastCheck: Date.now() }),
+    instance_health_all: () => [{ id: 'local', online: true, version: '2026.3.5', gatewayRunning: true, lastCheck: Date.now() }],
     check_node: () => ({ installed: true, version: 'v20.11.0' }),
     get_deploy_config: () => ({ gatewayUrl: 'http://127.0.0.1:18789', authToken: '', version: '2026.2.23' }),
     read_mcp_config: () => ({
@@ -361,6 +400,32 @@ export const api = {
   skillsInstallDep: (kind, spec) => invoke('skills_install_dep', { kind, spec }),
   skillsClawHubSearch: (query) => invoke('skills_clawhub_search', { query }),
   skillsClawHubInstall: (slug) => invoke('skills_clawhub_install', { slug }),
+
+  // 实例管理
+  instanceList: () => cachedInvoke('instance_list', {}, 10000),
+  instanceAdd: (instance) => { invalidate('instance_list'); return invoke('instance_add', instance) },
+  instanceRemove: (id) => { invalidate('instance_list'); return invoke('instance_remove', { id }) },
+  instanceSetActive: (id) => { invalidate('instance_list'); _cache.clear(); return invoke('instance_set_active', { id }) },
+  instanceHealthCheck: (id) => invoke('instance_health_check', { id }),
+  instanceHealthAll: () => invoke('instance_health_all'),
+
+  // Docker 集群管理
+  getDeployMode: () => cachedInvoke('get_deploy_mode', {}, 60000),
+  dockerClusterOverview: () => invoke('docker_cluster_overview'),
+  dockerTestEndpoint: (endpoint) => invoke('docker_test_endpoint', { endpoint }),
+  dockerInfo: (nodeId) => invoke('docker_info', { nodeId }),
+  dockerListContainers: (nodeId, all = true) => invoke('docker_list_containers', { nodeId, all }),
+  dockerCreateContainer: (opts) => invoke('docker_create_container', opts),
+  dockerStartContainer: (nodeId, containerId) => { invalidate('docker_cluster_overview', 'docker_list_containers'); return invoke('docker_start_container', { nodeId, containerId }) },
+  dockerStopContainer: (nodeId, containerId) => { invalidate('docker_cluster_overview', 'docker_list_containers'); return invoke('docker_stop_container', { nodeId, containerId }) },
+  dockerRestartContainer: (nodeId, containerId) => { invalidate('docker_cluster_overview', 'docker_list_containers'); return invoke('docker_restart_container', { nodeId, containerId }) },
+  dockerRemoveContainer: (nodeId, containerId, force = false) => { invalidate('docker_cluster_overview', 'docker_list_containers'); return invoke('docker_remove_container', { nodeId, containerId, force }) },
+  dockerContainerLogs: (nodeId, containerId, tail = 200) => invoke('docker_container_logs', { nodeId, containerId, tail }),
+  dockerPullImage: (nodeId, image, tag) => invoke('docker_pull_image', { nodeId, image, tag }),
+  dockerListImages: (nodeId) => invoke('docker_list_images', { nodeId }),
+  dockerListNodes: () => cachedInvoke('docker_list_nodes', {}, 30000),
+  dockerAddNode: (name, endpoint) => { invalidate('docker_list_nodes', 'docker_cluster_overview'); return invoke('docker_add_node', { name, endpoint }) },
+  dockerRemoveNode: (nodeId) => { invalidate('docker_list_nodes', 'docker_cluster_overview'); return invoke('docker_remove_node', { nodeId }) },
 
   // 前端热更新
   checkFrontendUpdate: () => invoke('check_frontend_update'),

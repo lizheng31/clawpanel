@@ -4,7 +4,7 @@
 import { registerRoute, initRouter, navigate, setDefaultRoute } from './router.js'
 import { renderSidebar } from './components/sidebar.js'
 import { initTheme } from './lib/theme.js'
-import { detectOpenclawStatus, isOpenclawReady, isGatewayRunning, onGatewayChange, startGatewayPoll, onGuardianGiveUp, resetAutoRestart } from './lib/app-state.js'
+import { detectOpenclawStatus, isOpenclawReady, isGatewayRunning, onGatewayChange, startGatewayPoll, onGuardianGiveUp, resetAutoRestart, loadActiveInstance, getActiveInstance, onInstanceChange } from './lib/app-state.js'
 import { wsClient } from './lib/ws-client.js'
 import { api } from './lib/tauri-api.js'
 import { version as APP_VERSION } from '../package.json'
@@ -60,10 +60,20 @@ function _hideSplash() {
   if (splash) { splash.classList.add('hide'); setTimeout(() => splash.remove(), 500) }
 }
 
+let _loginFailCount = 0
+const CAPTCHA_THRESHOLD = 3
+
+function _genCaptcha() {
+  const a = Math.floor(Math.random() * 20) + 1
+  const b = Math.floor(Math.random() * 20) + 1
+  return { q: `${a} + ${b} = ?`, a: a + b }
+}
+
 function showLoginOverlay(defaultPw) {
   const hasDefault = !!defaultPw
   const overlay = document.createElement('div')
   overlay.id = 'login-overlay'
+  let _captcha = _loginFailCount >= CAPTCHA_THRESHOLD ? _genCaptcha() : null
   overlay.innerHTML = `
     <div class="login-card">
       ${_logoSvg}
@@ -73,10 +83,23 @@ function showLoginOverlay(defaultPw) {
         : (isTauri ? '应用已锁定，请输入密码' : '请输入访问密码')}</div>
       <form id="login-form">
         <input class="login-input" type="${hasDefault ? 'text' : 'password'}" id="login-pw" placeholder="访问密码" autocomplete="current-password" autofocus value="${hasDefault ? defaultPw : ''}" />
+        <div id="login-captcha" style="display:${_captcha ? 'block' : 'none'};margin-bottom:10px">
+          <div style="font-size:12px;color:#888;margin-bottom:6px">请先完成验证：<strong id="captcha-q" style="color:var(--text-primary,#333)">${_captcha ? _captcha.q : ''}</strong></div>
+          <input class="login-input" type="number" id="login-captcha-input" placeholder="输入计算结果" style="text-align:center" />
+        </div>
         <button class="login-btn" type="submit">登 录</button>
         <div class="login-error" id="login-error"></div>
       </form>
-      <div style="margin-top:20px;font-size:11px;color:#aaa;text-align:center">
+      ${!hasDefault ? `<details class="login-forgot" style="margin-top:16px;text-align:center">
+        <summary style="font-size:11px;color:#aaa;cursor:pointer;list-style:none;user-select:none">忘记密码？</summary>
+        <div style="margin-top:8px;font-size:11px;color:#888;line-height:1.8;text-align:left;background:rgba(0,0,0,.03);border-radius:8px;padding:10px 14px">
+          ${isTauri
+            ? '删除配置文件中的 <code style="background:rgba(99,102,241,.1);padding:1px 5px;border-radius:3px;font-size:10px">accessPassword</code> 字段即可重置：<br><code style="background:rgba(99,102,241,.1);padding:2px 6px;border-radius:3px;font-size:10px;word-break:break-all">~/.openclaw/clawpanel.json</code>'
+            : '编辑服务器上的配置文件，删除 <code style="background:rgba(99,102,241,.1);padding:1px 5px;border-radius:3px;font-size:10px">accessPassword</code> 字段后重启服务：<br><code style="background:rgba(99,102,241,.1);padding:2px 6px;border-radius:3px;font-size:10px;word-break:break-all">~/.openclaw/clawpanel.json</code>'
+          }
+        </div>
+      </details>` : ''}
+      <div style="margin-top:${hasDefault ? '20' : '12'}px;font-size:11px;color:#aaa;text-align:center">
         <a href="https://claw.qt.cool" target="_blank" rel="noopener" style="color:#aaa;text-decoration:none">claw.qt.cool</a>
         <span style="margin:0 6px">·</span>v${APP_VERSION}
       </div>
@@ -94,18 +117,46 @@ function showLoginOverlay(defaultPw) {
       btn.disabled = true
       btn.textContent = '登录中...'
       errEl.textContent = ''
+      // 验证码校验
+      if (_captcha) {
+        const captchaVal = parseInt(overlay.querySelector('#login-captcha-input')?.value)
+        if (captchaVal !== _captcha.a) {
+          errEl.textContent = '验证码错误'
+          _captcha = _genCaptcha()
+          const qEl = overlay.querySelector('#captcha-q')
+          if (qEl) qEl.textContent = _captcha.q
+          overlay.querySelector('#login-captcha-input').value = ''
+          btn.disabled = false
+          btn.textContent = '登 录'
+          return
+        }
+      }
       try {
         if (isTauri) {
           // 桌面端：本地比对密码
           const { api } = await import('./lib/tauri-api.js')
           const cfg = await api.readPanelConfig()
           if (pw !== cfg.accessPassword) {
-            errEl.textContent = '密码错误'
+            _loginFailCount++
+            if (_loginFailCount >= CAPTCHA_THRESHOLD && !_captcha) {
+              _captcha = _genCaptcha()
+              const cEl = overlay.querySelector('#login-captcha')
+              if (cEl) { cEl.style.display = 'block'; cEl.querySelector('#captcha-q').textContent = _captcha.q }
+            }
+            errEl.textContent = `密码错误${_loginFailCount >= CAPTCHA_THRESHOLD ? '' : ` (${_loginFailCount}/${CAPTCHA_THRESHOLD})`}`
             btn.disabled = false
             btn.textContent = '登 录'
             return
           }
           sessionStorage.setItem('clawpanel_authed', '1')
+          // 同步建立 web session（WEB_ONLY_CMDS 需要 cookie 认证）
+          try {
+            await fetch('/__api/auth_login', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ password: pw }),
+            })
+          } catch {}
           overlay.classList.add('hide')
           setTimeout(() => overlay.remove(), 400)
           if (cfg.accessPassword === '123456') {
@@ -121,7 +172,13 @@ function showLoginOverlay(defaultPw) {
           })
           const data = await resp.json()
           if (!resp.ok) {
-            errEl.textContent = data.error || '登录失败'
+            _loginFailCount++
+            if (_loginFailCount >= CAPTCHA_THRESHOLD && !_captcha) {
+              _captcha = _genCaptcha()
+              const cEl = overlay.querySelector('#login-captcha')
+              if (cEl) { cEl.style.display = 'block'; cEl.querySelector('#captcha-q').textContent = _captcha.q }
+            }
+            errEl.textContent = (data.error || '登录失败') + (_loginFailCount >= CAPTCHA_THRESHOLD ? '' : ` (${_loginFailCount}/${CAPTCHA_THRESHOLD})`)
             btn.disabled = false
             btn.textContent = '登 录'
             return
@@ -169,6 +226,7 @@ async function boot() {
   registerRoute('/about', () => import('./pages/about.js'))
   registerRoute('/assistant', () => import('./pages/assistant.js'))
   registerRoute('/setup', () => import('./pages/setup.js'))
+  registerRoute('/docker', () => import('./pages/docker.js'))
 
   renderSidebar(sidebar)
   initRouter(content)
@@ -193,8 +251,20 @@ async function boot() {
     document.body.prepend(banner)
   }
 
-  // 后台检测状态，检测完再决定是否跳转 setup
-  detectOpenclawStatus().then(() => {
+  // Tauri 模式：确保 web session 存在（页面刷新后 cookie 可能丢失），然后加载实例和检测状态
+  const ensureWebSession = isTauri
+    ? api.readPanelConfig().then(cfg => {
+        if (cfg.accessPassword) {
+          return fetch('/__api/auth_login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password: cfg.accessPassword }),
+          }).catch(() => {})
+        }
+      }).catch(() => {})
+    : Promise.resolve()
+
+  ensureWebSession.then(() => loadActiveInstance()).then(() => detectOpenclawStatus()).then(() => {
     // 重新渲染侧边栏（检测完成后 isOpenclawReady 状态已更新）
     renderSidebar(sidebar)
     if (!isOpenclawReady()) {
@@ -223,13 +293,21 @@ async function boot() {
       onGuardianGiveUp(() => {
         showGuardianRecovery()
       })
+
+      // 实例切换时，重连 WebSocket + 重新检测状态
+      onInstanceChange(async () => {
+        wsClient.disconnect()
+        await detectOpenclawStatus()
+        if (isGatewayRunning()) autoConnectWebSocket()
+      })
     }
   })
 }
 
 async function autoConnectWebSocket() {
   try {
-    console.log('[main] 自动连接 WebSocket...')
+    const inst = getActiveInstance()
+    console.log(`[main] 自动连接 WebSocket (实例: ${inst.name})...`)
     const config = await api.readOpenclawConfig()
     const port = config?.gateway?.port || 18789
     const token = config?.gateway?.auth?.token || ''
@@ -270,9 +348,20 @@ async function autoConnectWebSocket() {
       }
     }
 
-    const host = window.__TAURI_INTERNALS__ ? `127.0.0.1:${port}` : location.host
+    let host
+    const inst2 = getActiveInstance()
+    if (inst2.type !== 'local' && inst2.endpoint) {
+      try {
+        const url = new URL(inst2.endpoint)
+        host = `${url.hostname}:${inst2.gatewayPort || port}`
+      } catch {
+        host = window.__TAURI_INTERNALS__ ? `127.0.0.1:${port}` : location.host
+      }
+    } else {
+      host = window.__TAURI_INTERNALS__ ? `127.0.0.1:${port}` : location.host
+    }
     wsClient.connect(host, token)
-    console.log('[main] WebSocket 连接已启动')
+    console.log(`[main] WebSocket 连接已启动 -> ${host}`)
   } catch (e) {
     console.error('[main] 自动连接 WebSocket 失败:', e)
   }
@@ -382,11 +471,118 @@ function showGuardianRecovery() {
   })
 }
 
+// === 全局版本更新检测 ===
+const UPDATE_CHECK_INTERVAL = 30 * 60 * 1000 // 30 分钟
+let _updateCheckTimer = null
+
+async function checkGlobalUpdate() {
+  const banner = document.getElementById('update-banner')
+  if (!banner) return
+
+  try {
+    const info = await api.checkFrontendUpdate()
+    if (!info.hasUpdate) return
+
+    const ver = info.latestVersion || info.manifest?.version || ''
+    if (!ver) return
+
+    // 用户已忽略过该版本，不再打扰
+    const dismissed = sessionStorage.getItem('clawpanel_update_dismissed')
+    if (dismissed === ver) return
+
+    const changelog = info.manifest?.changelog || ''
+    const isWeb = !window.__TAURI_INTERNALS__
+
+    banner.classList.remove('update-banner-hidden')
+    banner.innerHTML = `
+      <div class="update-banner-content">
+        <div class="update-banner-text">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          <span class="update-banner-ver">ClawPanel v${ver} 可用</span>
+          ${changelog ? `<span class="update-banner-changelog">· ${changelog}</span>` : ''}
+        </div>
+        ${isWeb
+          ? `<button class="btn btn-sm" id="btn-update-show-cmd">更新方法</button>
+             <a class="btn btn-sm" href="https://github.com/qingchencloud/clawpanel/releases" target="_blank" rel="noopener">Release Notes</a>`
+          : `<button class="btn btn-sm" id="btn-update-hot">热更新</button>
+             <a class="btn btn-sm" href="https://github.com/qingchencloud/clawpanel/releases" target="_blank" rel="noopener">完整安装包</a>`
+        }
+        <button class="update-banner-close" id="btn-update-dismiss" title="忽略此版本">✕</button>
+      </div>
+    `
+
+    // 关闭按钮：记住忽略的版本
+    banner.querySelector('#btn-update-dismiss')?.addEventListener('click', () => {
+      sessionStorage.setItem('clawpanel_update_dismissed', ver)
+      banner.classList.add('update-banner-hidden')
+    })
+
+    // Web 模式：显示更新命令弹窗
+    banner.querySelector('#btn-update-show-cmd')?.addEventListener('click', () => {
+      const overlay = document.createElement('div')
+      overlay.className = 'modal-overlay'
+      overlay.innerHTML = `
+        <div class="modal" style="max-width:480px">
+          <div class="modal-title">更新到 v${ver}</div>
+          <div style="font-size:var(--font-size-sm);line-height:1.8">
+            <p style="margin-bottom:12px">在服务器上执行以下命令：</p>
+            <pre style="background:var(--bg-tertiary);padding:12px 16px;border-radius:var(--radius-md);font-family:var(--font-mono);font-size:var(--font-size-xs);overflow-x:auto;white-space:pre-wrap;user-select:all">cd /opt/clawpanel
+git pull origin main
+npm install
+npm run build
+sudo systemctl restart clawpanel</pre>
+            <p style="margin-top:12px;color:var(--text-tertiary);font-size:var(--font-size-xs)">
+              如果 git pull 失败，可先执行 <code style="background:var(--bg-tertiary);padding:2px 6px;border-radius:4px">git checkout -- .</code> 丢弃本地修改。<br>
+              路径请替换为实际的 ClawPanel 安装目录。
+            </p>
+          </div>
+          <div class="modal-actions">
+            <button class="btn btn-secondary btn-sm" data-action="close">关闭</button>
+          </div>
+        </div>
+      `
+      document.body.appendChild(overlay)
+      overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove() })
+      overlay.querySelector('[data-action="close"]').onclick = () => overlay.remove()
+      overlay.addEventListener('keydown', (e) => { if (e.key === 'Escape') overlay.remove() })
+    })
+
+    // Tauri 热更新按钮
+    banner.querySelector('#btn-update-hot')?.addEventListener('click', async () => {
+      const btn = banner.querySelector('#btn-update-hot')
+      if (!btn) return
+      btn.disabled = true
+      btn.textContent = '下载中...'
+      try {
+        await api.downloadFrontendUpdate(info.manifest?.url || '', info.manifest?.hash || '')
+        btn.textContent = '重载应用'
+        btn.disabled = false
+        btn.onclick = () => window.location.reload()
+      } catch (e) {
+        btn.textContent = '下载失败'
+        btn.disabled = false
+        const { toast } = await import('./components/toast.js')
+        toast('更新下载失败: ' + (e.message || e), 'error')
+      }
+    })
+  } catch {
+    // 检查失败静默忽略
+  }
+}
+
+function startUpdateChecker() {
+  // 启动后 5 秒检查一次
+  setTimeout(checkGlobalUpdate, 5000)
+  // 之后每 30 分钟检查一次
+  _updateCheckTimer = setInterval(checkGlobalUpdate, UPDATE_CHECK_INTERVAL)
+}
+
 // 启动：先检查认证，再加载应用
 ;(async () => {
   const auth = await checkAuth()
   if (!auth.ok) await showLoginOverlay(auth.defaultPw)
   boot()
+  startUpdateChecker()
 
   // 初始化全局 AI 助手浮动按钮（延迟加载，不阻塞启动）
   setTimeout(async () => {

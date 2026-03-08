@@ -3,7 +3,8 @@
  */
 import { navigate, getCurrentRoute } from '../router.js'
 import { toggleTheme, getTheme } from '../lib/theme.js'
-import { isOpenclawReady } from '../lib/app-state.js'
+import { isOpenclawReady, getActiveInstance, switchInstance, onInstanceChange } from '../lib/app-state.js'
+import { api } from '../lib/tauri-api.js'
 import { version as APP_VERSION } from '../../package.json'
 
 const NAV_ITEMS_FULL = [
@@ -37,6 +38,12 @@ const NAV_ITEMS_FULL = [
     items: [
       { route: '/extensions', label: '扩展工具', icon: 'extensions' },
       { route: '/skills', label: 'Skills', icon: 'skills' },
+    ]
+  },
+  {
+    section: 'Docker',
+    items: [
+      { route: '/docker', label: 'Docker 集群', icon: 'docker' },
     ]
   },
   {
@@ -87,13 +94,30 @@ const ICONS = {
   assistant: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z"/><path d="M18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 00-2.456 2.456z"/></svg>',
   security: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>',
   skills: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3.77-3.77a6 6 0 01-7.94 7.94l-6.91 6.91a2.12 2.12 0 01-3-3l6.91-6.91a6 6 0 017.94-7.94l-3.76 3.76z"/></svg>',
+  docker: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="1" y="11" width="4" height="3" rx=".5"/><rect x="6" y="11" width="4" height="3" rx=".5"/><rect x="11" y="11" width="4" height="3" rx=".5"/><rect x="6" y="7" width="4" height="3" rx=".5"/><rect x="11" y="7" width="4" height="3" rx=".5"/><rect x="16" y="11" width="4" height="3" rx=".5"/><rect x="11" y="3" width="4" height="3" rx=".5"/><path d="M2 17c1 3 4 5 10 5s9-2 10-5"/></svg>',
   debug: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/><circle cx="12" cy="12" r="3"/></svg>',
 }
 
 let _delegated = false
+let _hasMultipleInstances = false
+
+// 异步检测是否有多实例（首次渲染后触发，有多实例时重渲染）
+function _checkMultiInstances(el) {
+  api.instanceList().then(data => {
+    const has = data.instances && data.instances.length > 1
+    if (has !== _hasMultipleInstances) {
+      _hasMultipleInstances = has
+      renderSidebar(el)
+    }
+  }).catch(() => {})
+}
 
 export function renderSidebar(el) {
   const current = getCurrentRoute()
+
+  const inst = getActiveInstance()
+  const isLocal = inst.type === 'local'
+  const showSwitcher = !isLocal || _hasMultipleInstances
 
   let html = `
     <div class="sidebar-header">
@@ -102,6 +126,14 @@ export function renderSidebar(el) {
       </div>
       <span class="sidebar-title">ClawPanel</span>
     </div>
+    ${showSwitcher ? `<div class="instance-switcher" id="instance-switcher">
+      <button class="instance-current" id="btn-instance-toggle">
+        <span class="instance-dot ${isLocal ? 'local' : 'remote'}"></span>
+        <span class="instance-label">${_escSidebar(inst.name)}</span>
+        <svg class="instance-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+      <div class="instance-dropdown" id="instance-dropdown"></div>
+    </div>` : ''}
     <nav class="sidebar-nav">
   `
 
@@ -143,6 +175,9 @@ export function renderSidebar(el) {
 
   el.innerHTML = html
 
+  // 首次渲染时异步检测多实例
+  if (!_delegated) _checkMultiInstances(el)
+
   // 事件委托：只绑定一次，避免重复绑定
   if (!_delegated) {
     _delegated = true
@@ -158,7 +193,132 @@ export function renderSidebar(el) {
       if (themeBtn) {
         toggleTheme()
         renderSidebar(el)
+        return
+      }
+      // 实例切换器
+      const toggleBtn = e.target.closest('#btn-instance-toggle')
+      if (toggleBtn) {
+        _toggleInstanceDropdown(el)
+        return
+      }
+      // 选择实例
+      const opt = e.target.closest('.instance-option[data-id]')
+      if (opt) {
+        const id = opt.dataset.id
+        _closeInstanceDropdown()
+        if (id !== getActiveInstance().id) {
+          opt.style.opacity = '0.5'
+          switchInstance(id).then(() => {
+            renderSidebar(el)
+            navigate(getCurrentRoute())
+          })
+        }
+        return
+      }
+      // 添加实例
+      const addBtn = e.target.closest('#btn-instance-add')
+      if (addBtn) {
+        _closeInstanceDropdown()
+        _showAddInstanceDialog(el)
+        return
+      }
+      // 点击其他区域关闭下拉
+      if (!e.target.closest('.instance-switcher')) {
+        _closeInstanceDropdown()
       }
     })
+
+    // 监听实例变化，刷新多实例标记后重新渲染
+    onInstanceChange(() => { _checkMultiInstances(el); renderSidebar(el) })
+  }
+}
+
+function _escSidebar(s) { return String(s || '').replace(/</g, '&lt;').replace(/>/g, '&gt;') }
+
+function _closeInstanceDropdown() {
+  const dd = document.getElementById('instance-dropdown')
+  if (dd) dd.classList.remove('open')
+}
+
+async function _toggleInstanceDropdown(sidebarEl) {
+  const dd = document.getElementById('instance-dropdown')
+  if (!dd) return
+  if (dd.classList.contains('open')) { dd.classList.remove('open'); return }
+
+  dd.innerHTML = '<div style="padding:8px;color:var(--text-tertiary);font-size:12px">loading...</div>'
+  dd.classList.add('open')
+
+  try {
+    const [data, health] = await Promise.all([api.instanceList(), api.instanceHealthAll()])
+    const healthMap = Object.fromEntries((health || []).map(h => [h.id, h]))
+    const activeId = getActiveInstance().id
+    let html = ''
+    for (const inst of data.instances) {
+      const h = healthMap[inst.id] || {}
+      const active = inst.id === activeId ? ' active' : ''
+      const dot = h.online !== false ? 'online' : 'offline'
+      const badge = inst.type === 'docker' ? '<span class="instance-badge">Docker</span>' : inst.type === 'remote' ? '<span class="instance-badge">Remote</span>' : ''
+      html += `<div class="instance-option${active}" data-id="${inst.id}">
+        <span class="instance-dot ${dot}"></span>
+        <span class="instance-opt-name">${_escSidebar(inst.name)}</span>
+        ${badge}
+      </div>`
+    }
+    html += '<div class="instance-divider"></div>'
+    html += '<div class="instance-option instance-add" id="btn-instance-add">+ Add Instance</div>'
+    dd.innerHTML = html
+  } catch (e) {
+    dd.innerHTML = `<div style="padding:8px;color:var(--error);font-size:12px">${_escSidebar(e.message)}</div>`
+  }
+}
+
+async function _showAddInstanceDialog(sidebarEl) {
+  const overlay = document.createElement('div')
+  overlay.className = 'docker-dialog-overlay'
+  overlay.innerHTML = `
+    <div class="docker-dialog">
+      <div class="docker-dialog-title">Add Instance</div>
+      <div class="form-group" style="margin-bottom:var(--space-md)">
+        <label class="form-label">Name</label>
+        <input class="form-input" id="inst-name" placeholder="My Server" />
+      </div>
+      <div class="form-group" style="margin-bottom:var(--space-md)">
+        <label class="form-label">Panel Endpoint</label>
+        <input class="form-input" id="inst-endpoint" placeholder="http://192.168.1.100:1420" />
+      </div>
+      <div class="form-group" style="margin-bottom:var(--space-md)">
+        <label class="form-label">Gateway Port (optional)</label>
+        <input class="form-input" id="inst-gw-port" type="number" value="18789" />
+      </div>
+      <div class="docker-dialog-hint">
+        The remote server must be running ClawPanel (serve.js).<br/>
+        Example: <code>http://192.168.1.100:1420</code>
+      </div>
+      <div id="inst-add-error" style="color:var(--error);font-size:12px;margin-top:var(--space-sm)"></div>
+      <div class="docker-dialog-actions">
+        <button class="btn btn-secondary btn-sm" id="inst-cancel">Cancel</button>
+        <button class="btn btn-primary btn-sm" id="inst-confirm">Add</button>
+      </div>
+    </div>
+  `
+  document.body.appendChild(overlay)
+  overlay.querySelector('#inst-cancel').onclick = () => overlay.remove()
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove() })
+  overlay.querySelector('#inst-confirm').onclick = async () => {
+    const name = overlay.querySelector('#inst-name').value.trim()
+    const endpoint = overlay.querySelector('#inst-endpoint').value.trim()
+    const gwPort = parseInt(overlay.querySelector('#inst-gw-port').value) || 18789
+    const errEl = overlay.querySelector('#inst-add-error')
+    if (!name || !endpoint) { errEl.textContent = 'Name and endpoint are required'; return }
+    const btn = overlay.querySelector('#inst-confirm')
+    btn.disabled = true; btn.textContent = 'Adding...'
+    try {
+      await api.instanceAdd({ name, type: 'remote', endpoint, gatewayPort: gwPort })
+      overlay.remove()
+      renderSidebar(sidebarEl)
+    } catch (e) {
+      errEl.textContent = e.message || String(e)
+      btn.disabled = false; btn.textContent = 'Add'
+    }
   }
 }

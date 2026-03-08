@@ -4,6 +4,9 @@ import fs from 'fs'
 import path from 'path'
 import { homedir } from 'os'
 
+// 读取 package.json 版本号，构建时注入前端
+const pkg = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'))
+
 // 读取 Gateway 端口（启动时读取一次）
 let gatewayPort = 18789
 try {
@@ -13,6 +16,9 @@ try {
 
 export default defineConfig({
   plugins: [devApiPlugin()],
+  define: {
+    __APP_VERSION__: JSON.stringify(pkg.version),
+  },
   clearScreen: false,
   server: {
     port: 1420,

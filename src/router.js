@@ -62,7 +62,7 @@ async function loadRoute() {
     _contentEl.appendChild(spinnerEl)
 
     try {
-      mod = await withTimeout(loader(), 15000, '模块加载超时')
+      mod = await retryLoad(loader, 3, 500)
     } catch (e) {
       console.error('[router] 模块加载失败:', hash, e)
       if (thisLoad === _loadId) showLoadError(_contentEl, hash, e)
@@ -104,6 +104,22 @@ async function loadRoute() {
   document.querySelectorAll('.nav-item').forEach(item => {
     item.classList.toggle('active', item.dataset.route === hash)
   })
+}
+
+async function retryLoad(loader, maxRetries, delayMs) {
+  for (let i = 0; i <= maxRetries; i++) {
+    try {
+      return await withTimeout(loader(), 15000, '模块加载超时')
+    } catch (e) {
+      const isNetworkError = /fetch|network|connection|ERR_/i.test(String(e?.message || e))
+      if (i < maxRetries && isNetworkError) {
+        console.warn(`[router] 模块加载失败，${delayMs}ms 后重试 (${i + 1}/${maxRetries})...`)
+        await new Promise(r => setTimeout(r, delayMs))
+        continue
+      }
+      throw e
+    }
+  }
 }
 
 function withTimeout(promise, ms, msg) {

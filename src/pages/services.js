@@ -5,7 +5,7 @@
 import { api } from '../lib/tauri-api.js'
 import { toast } from '../components/toast.js'
 import { showConfirm, showUpgradeModal } from '../components/modal.js'
-import { isMacPlatform, setUpgrading, setUserStopped, resetAutoRestart } from '../lib/app-state.js'
+import { isMacPlatform, isInDocker, setUpgrading, setUserStopped, resetAutoRestart } from '../lib/app-state.js'
 import { diagnoseInstallError } from '../lib/error-diagnosis.js'
 import { icon, statusIcon } from '../lib/icons.js'
 
@@ -44,18 +44,21 @@ export async function render() {
     </div>
   `
 
+  // Docker 模式下隐藏 npm 源设置
+  if (isInDocker()) {
+    const regSection = page.querySelector('#registry-section')
+    if (regSection) regSection.style.display = 'none'
+  }
+
   bindEvents(page)
   loadAll(page)
   return page
 }
 
 async function loadAll(page) {
-  await Promise.all([
-    loadVersion(page),
-    loadServices(page),
-    loadRegistry(page),
-    loadBackups(page),
-  ])
+  const tasks = [loadVersion(page), loadServices(page), loadBackups(page)]
+  if (!isInDocker()) tasks.push(loadRegistry(page))
+  await Promise.all(tasks)
 }
 
 // ===== 版本检测 =====
@@ -74,21 +77,39 @@ async function loadVersion(page) {
     const sourceTag = isChinese ? '汉化优化版' : '官方原版'
     const switchLabel = isChinese ? '切换到官方版' : '切换到汉化版'
     const switchTarget = isChinese ? 'official' : 'chinese'
-    bar.innerHTML = `
-      <div class="stat-cards" style="margin-bottom:var(--space-lg)">
-        <div class="stat-card">
-          <div class="stat-card-header">
-            <span class="stat-card-label">当前版本 · <span style="color:var(--accent)">${sourceTag}</span></span>
-          </div>
-          <div class="stat-card-value">${ver}</div>
-          <div class="stat-card-meta">${hasUpdate ? '新版本: ' + info.latest : '已是最新版本'}</div>
-          <div style="display:flex;gap:var(--space-sm);margin-top:var(--space-sm);flex-wrap:wrap">
-            ${hasUpdate ? '<button class="btn btn-primary btn-sm" data-action="upgrade">升级到最新版</button>' : ''}
-            <button class="btn btn-secondary btn-sm" data-action="switch-source" data-source="${switchTarget}">${switchLabel}</button>
+
+    if (isInDocker()) {
+      bar.innerHTML = `
+        <div class="stat-cards" style="margin-bottom:var(--space-lg)">
+          <div class="stat-card">
+            <div class="stat-card-header">
+              <span class="stat-card-label">当前版本 · <span style="color:var(--accent)">Docker 部署</span></span>
+            </div>
+            <div class="stat-card-value">${ver}</div>
+            <div class="stat-card-meta">${hasUpdate ? '新版本: ' + info.latest + '（请拉取新镜像更新）' : '已是最新版本'}</div>
+            ${hasUpdate ? `<div style="margin-top:var(--space-sm)">
+              <code style="font-size:var(--font-size-xs);background:var(--bg-tertiary);padding:4px 8px;border-radius:4px;user-select:all">docker pull ghcr.io/qingchencloud/openclaw:latest</code>
+            </div>` : ''}
           </div>
         </div>
-      </div>
-    `
+      `
+    } else {
+      bar.innerHTML = `
+        <div class="stat-cards" style="margin-bottom:var(--space-lg)">
+          <div class="stat-card">
+            <div class="stat-card-header">
+              <span class="stat-card-label">当前版本 · <span style="color:var(--accent)">${sourceTag}</span></span>
+            </div>
+            <div class="stat-card-value">${ver}</div>
+            <div class="stat-card-meta">${hasUpdate ? '新版本: ' + info.latest : '已是最新版本'}</div>
+            <div style="display:flex;gap:var(--space-sm);margin-top:var(--space-sm);flex-wrap:wrap">
+              ${hasUpdate ? '<button class="btn btn-primary btn-sm" data-action="upgrade">升级到最新版</button>' : ''}
+              <button class="btn btn-secondary btn-sm" data-action="switch-source" data-source="${switchTarget}">${switchLabel}</button>
+            </div>
+          </div>
+        </div>
+      `
+    }
   } catch (e) {
     bar.innerHTML = `<div class="stat-card" style="margin-bottom:var(--space-lg)"><div class="stat-card-label">版本信息加载失败</div></div>`
   }

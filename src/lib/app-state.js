@@ -7,6 +7,9 @@ import { api } from './tauri-api.js'
 let _openclawReady = false
 let _gatewayRunning = false
 let _platform = ''  // 'macos' | 'win32' | ...
+let _deployMode = 'local' // 'local' | 'docker'
+let _inDocker = false
+let _dockerAvailable = false
 let _listeners = []
 let _gwListeners = []
 let _gwStopCount = 0  // 连续检测到"停止"的次数，防抖用
@@ -54,6 +57,40 @@ export function isMacPlatform() {
   return _platform === 'macos'
 }
 
+/** 部署模式 */
+export function getDeployMode() { return _deployMode }
+export function isInDocker() { return _inDocker }
+export function isDockerAvailable() { return _dockerAvailable }
+
+/** 实例管理 */
+let _activeInstance = { id: 'local', name: '本机', type: 'local' }
+let _instanceListeners = []
+
+export function getActiveInstance() { return _activeInstance }
+export function isLocalInstance() { return _activeInstance.type === 'local' }
+
+export function onInstanceChange(fn) {
+  _instanceListeners.push(fn)
+  return () => { _instanceListeners = _instanceListeners.filter(cb => cb !== fn) }
+}
+
+export async function switchInstance(id) {
+  // instanceSetActive 内部已调用 _cache.clear()，切换后所有缓存自动失效
+  await api.instanceSetActive(id)
+  const data = await api.instanceList()
+  _activeInstance = data.instances.find(i => i.id === id) || data.instances[0]
+  _instanceListeners.forEach(fn => { try { fn(_activeInstance) } catch {} })
+}
+
+export async function loadActiveInstance() {
+  try {
+    const data = await api.instanceList()
+    _activeInstance = data.instances.find(i => i.id === data.activeId) || data.instances[0]
+  } catch {
+    _activeInstance = { id: 'local', name: '本机', type: 'local' }
+  }
+}
+
 /** 监听 Gateway 状态变化 */
 export function onGatewayChange(fn) {
   _gwListeners.push(fn)
@@ -70,6 +107,10 @@ export async function detectOpenclawStatus() {
     const configExists = installation.status === 'fulfilled' && installation.value?.installed
     if (installation.status === 'fulfilled' && installation.value?.platform) {
       _platform = installation.value.platform
+    }
+    if (installation.status === 'fulfilled' && installation.value?.inDocker) {
+      _inDocker = true
+      _deployMode = 'docker'
     }
     const cliInstalled = services.status === 'fulfilled'
       && services.value?.length > 0

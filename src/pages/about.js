@@ -64,12 +64,12 @@ async function loadData(page) {
     ])
 
     // 尝试从 Tauri API 获取 ClawPanel 自身版本号，失败则 fallback
-    let panelVersion = '0.1.0'
+    let panelVersion = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '0.1.0'
     try {
       const { getVersion } = await import('@tauri-apps/api/app')
       panelVersion = await getVersion()
     } catch {
-      // 非 Tauri 环境或 API 不可用，使用 fallback
+      // 非 Tauri 环境或 API 不可用，使用构建时注入的版本号
     }
 
     // 异步检查前端热更新

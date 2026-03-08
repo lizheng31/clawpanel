@@ -8,7 +8,9 @@ import path from 'path'
 import os from 'os'
 import { homedir, networkInterfaces } from 'os'
 import { execSync, spawn } from 'child_process'
+import { fileURLToPath } from 'url'
 import net from 'net'
+import http from 'http'
 import crypto from 'crypto'
 
 const OPENCLAW_DIR = path.join(homedir(), '.openclaw')
@@ -24,6 +26,28 @@ const isMac = process.platform === 'darwin'
 const isLinux = process.platform === 'linux'
 const SCOPES = ['operator.admin', 'operator.approvals', 'operator.pairing', 'operator.read', 'operator.write']
 const PANEL_CONFIG_PATH = path.join(OPENCLAW_DIR, 'clawpanel.json')
+const DOCKER_NODES_PATH = path.join(OPENCLAW_DIR, 'docker-nodes.json')
+const INSTANCES_PATH = path.join(OPENCLAW_DIR, 'instances.json')
+const DOCKER_SOCKET = process.platform === 'win32' ? '//./pipe/docker_engine' : '/var/run/docker.sock'
+const OPENCLAW_IMAGE = 'ghcr.io/qingchencloud/openclaw'
+
+// 语义化版本比较
+function versionGe(a, b) {
+  const pa = a.split('.').map(Number), pb = b.split('.').map(Number)
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    if ((pa[i] || 0) > (pb[i] || 0)) return true
+    if ((pa[i] || 0) < (pb[i] || 0)) return false
+  }
+  return true
+}
+function versionGt(a, b) {
+  const pa = a.split('.').map(Number), pb = b.split('.').map(Number)
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    if ((pa[i] || 0) > (pb[i] || 0)) return true
+    if ((pa[i] || 0) < (pb[i] || 0)) return false
+  }
+  return false
+}
 
 // === 访问密码 & Session 管理 ===
 
@@ -483,6 +507,159 @@ function linuxStopGateway() {
   }
 }
 
+// === Docker Socket 通信 ===
+
+function dockerRequest(method, apiPath, body = null, endpoint = null) {
+  return new Promise((resolve, reject) => {
+    const opts = { path: apiPath, method, headers: { 'Content-Type': 'application/json' } }
+    if (endpoint && endpoint.startsWith('tcp://')) {
+      const url = new URL(endpoint.replace('tcp://', 'http://'))
+      opts.hostname = url.hostname
+      opts.port = parseInt(url.port) || 2375
+    } else {
+      opts.socketPath = endpoint || DOCKER_SOCKET
+    }
+    const req = http.request(opts, (res) => {
+      let data = ''
+      res.on('data', chunk => data += chunk)
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, data: JSON.parse(data) }) }
+        catch { resolve({ status: res.statusCode, data }) }
+      })
+    })
+    req.on('error', (e) => reject(new Error('Docker 连接失败: ' + e.message)))
+    req.setTimeout(30000, () => { req.destroy(); reject(new Error('Docker API 超时')) })
+    if (body) req.write(JSON.stringify(body))
+    req.end()
+  })
+}
+
+function readDockerNodes() {
+  if (!fs.existsSync(DOCKER_NODES_PATH)) {
+    return [{ id: 'local', name: '本机', type: 'socket', endpoint: DOCKER_SOCKET }]
+  }
+  try {
+    const data = JSON.parse(fs.readFileSync(DOCKER_NODES_PATH, 'utf8'))
+    return data.nodes || []
+  } catch {
+    return [{ id: 'local', name: '本机', type: 'socket', endpoint: DOCKER_SOCKET }]
+  }
+}
+
+function saveDockerNodes(nodes) {
+  if (!fs.existsSync(OPENCLAW_DIR)) fs.mkdirSync(OPENCLAW_DIR, { recursive: true })
+  fs.writeFileSync(DOCKER_NODES_PATH, JSON.stringify({ nodes }, null, 2))
+}
+
+function isDockerAvailable() {
+  if (isWindows) return true // named pipe, can't stat
+  return fs.existsSync(DOCKER_SOCKET)
+}
+
+// === 实例注册表 ===
+
+const DEFAULT_LOCAL_INSTANCE = { id: 'local', name: '本机', type: 'local', endpoint: null, gatewayPort: 18789, addedAt: 0, note: '' }
+
+function readInstances() {
+  if (!fs.existsSync(INSTANCES_PATH)) {
+    return { activeId: 'local', instances: [{ ...DEFAULT_LOCAL_INSTANCE }] }
+  }
+  try {
+    const data = JSON.parse(fs.readFileSync(INSTANCES_PATH, 'utf8'))
+    if (!data.instances?.length) data.instances = [{ ...DEFAULT_LOCAL_INSTANCE }]
+    if (!data.instances.find(i => i.id === 'local')) data.instances.unshift({ ...DEFAULT_LOCAL_INSTANCE })
+    if (!data.activeId || !data.instances.find(i => i.id === data.activeId)) data.activeId = 'local'
+    return data
+  } catch {
+    return { activeId: 'local', instances: [{ ...DEFAULT_LOCAL_INSTANCE }] }
+  }
+}
+
+function saveInstances(data) {
+  if (!fs.existsSync(OPENCLAW_DIR)) fs.mkdirSync(OPENCLAW_DIR, { recursive: true })
+  fs.writeFileSync(INSTANCES_PATH, JSON.stringify(data, null, 2))
+}
+
+function getActiveInstance() {
+  const data = readInstances()
+  return data.instances.find(i => i.id === data.activeId) || data.instances[0]
+}
+
+async function proxyToInstance(instance, cmd, body) {
+  const url = `${instance.endpoint}/__api/${cmd}`
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const text = await resp.text()
+  try { return JSON.parse(text) }
+  catch { return text }
+}
+
+async function instanceHealthCheck(instance) {
+  const result = { id: instance.id, online: false, version: null, gatewayRunning: false, lastCheck: Date.now() }
+  if (instance.type === 'local') {
+    result.online = true
+    try {
+      const services = await handlers.get_services_status()
+      result.gatewayRunning = services?.[0]?.running === true
+    } catch {}
+    try {
+      const ver = await handlers.get_version_info()
+      result.version = ver?.current
+    } catch {}
+    return result
+  }
+  if (!instance.endpoint) return result
+  try {
+    const resp = await fetch(`${instance.endpoint}/__api/check_installation`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+      signal: AbortSignal.timeout(5000),
+    })
+    if (resp.ok) {
+      const data = await resp.json()
+      result.online = true
+      result.version = data?.version || null
+    }
+  } catch {}
+  if (result.online) {
+    try {
+      const resp = await fetch(`${instance.endpoint}/__api/get_services_status`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+        signal: AbortSignal.timeout(5000),
+      })
+      if (resp.ok) {
+        const services = await resp.json()
+        result.gatewayRunning = services?.[0]?.running === true
+      }
+    } catch {}
+  }
+  return result
+}
+
+// 始终在本机处理的命令（不代理到远程实例）
+const ALWAYS_LOCAL = new Set([
+  'instance_list', 'instance_add', 'instance_remove', 'instance_set_active',
+  'instance_health_check', 'instance_health_all',
+  'docker_info', 'docker_list_containers', 'docker_create_container',
+  'docker_start_container', 'docker_stop_container', 'docker_restart_container',
+  'docker_remove_container', 'docker_container_logs', 'docker_pull_image',
+  'docker_list_images', 'docker_list_nodes', 'docker_add_node', 'docker_remove_node',
+  'docker_cluster_overview',
+  'auth_check', 'auth_login', 'auth_logout',
+  'read_panel_config', 'write_panel_config',
+  'get_deploy_mode',
+  'assistant_exec', 'assistant_read_file', 'assistant_write_file',
+  'assistant_list_dir', 'assistant_system_info', 'assistant_list_processes',
+  'assistant_check_port', 'assistant_web_search', 'assistant_fetch_url',
+  'assistant_ensure_data_dir', 'assistant_save_image', 'assistant_load_image', 'assistant_delete_image',
+])
+
 // === API Handlers ===
 
 const handlers = {
@@ -591,9 +768,331 @@ const handlers = {
     }
   },
 
+  // === 实例管理 ===
+
+  instance_list() {
+    const data = readInstances()
+    return data
+  },
+
+  instance_add({ name, type, endpoint, gatewayPort, containerId, nodeId, note }) {
+    if (!name) throw new Error('实例名称不能为空')
+    if (!endpoint) throw new Error('端点地址不能为空')
+    const data = readInstances()
+    const id = type === 'docker' ? `docker-${(containerId || Date.now().toString(36)).slice(0, 12)}` : `remote-${Date.now().toString(36)}`
+    if (data.instances.find(i => i.endpoint === endpoint)) throw new Error('该端点已存在')
+    data.instances.push({
+      id, name, type: type || 'remote', endpoint,
+      gatewayPort: gatewayPort || 18789,
+      containerId: containerId || null,
+      nodeId: nodeId || null,
+      addedAt: Math.floor(Date.now() / 1000),
+      note: note || '',
+    })
+    saveInstances(data)
+    return { id, name }
+  },
+
+  instance_remove({ id }) {
+    if (id === 'local') throw new Error('本机实例不可删除')
+    const data = readInstances()
+    data.instances = data.instances.filter(i => i.id !== id)
+    if (data.activeId === id) data.activeId = 'local'
+    saveInstances(data)
+    return true
+  },
+
+  instance_set_active({ id }) {
+    const data = readInstances()
+    if (!data.instances.find(i => i.id === id)) throw new Error('实例不存在')
+    data.activeId = id
+    saveInstances(data)
+    return { activeId: id }
+  },
+
+  async instance_health_check({ id }) {
+    const data = readInstances()
+    const instance = data.instances.find(i => i.id === id)
+    if (!instance) throw new Error('实例不存在')
+    return instanceHealthCheck(instance)
+  },
+
+  async instance_health_all() {
+    const data = readInstances()
+    const results = await Promise.allSettled(data.instances.map(i => instanceHealthCheck(i)))
+    return results.map((r, idx) => r.status === 'fulfilled' ? r.value : { id: data.instances[idx].id, online: false, lastCheck: Date.now() })
+  },
+
+  // === Docker 集群管理 ===
+
+  async docker_test_endpoint({ endpoint } = {}) {
+    if (!endpoint) throw new Error('请提供端点地址')
+    const resp = await dockerRequest('GET', '/info', null, endpoint)
+    if (resp.status !== 200) throw new Error('Docker 守护进程未响应')
+    const d = resp.data
+    return {
+      ServerVersion: d.ServerVersion,
+      Containers: d.Containers,
+      Images: d.Images,
+      OS: d.OperatingSystem,
+    }
+  },
+
+  async docker_info({ nodeId } = {}) {
+    const nodes = readDockerNodes()
+    const node = nodeId ? nodes.find(n => n.id === nodeId) : nodes[0]
+    if (!node) throw new Error('节点不存在')
+    const resp = await dockerRequest('GET', '/info', null, node.endpoint)
+    if (resp.status !== 200) throw new Error('Docker 守护进程未响应')
+    const d = resp.data
+    return {
+      nodeId: node.id, nodeName: node.name,
+      containers: d.Containers, containersRunning: d.ContainersRunning,
+      containersPaused: d.ContainersPaused, containersStopped: d.ContainersStopped,
+      images: d.Images, serverVersion: d.ServerVersion,
+      os: d.OperatingSystem, arch: d.Architecture,
+      cpus: d.NCPU, memory: d.MemTotal,
+    }
+  },
+
+  async docker_list_containers({ nodeId, all = true } = {}) {
+    const nodes = readDockerNodes()
+    const node = nodeId ? nodes.find(n => n.id === nodeId) : nodes[0]
+    if (!node) throw new Error('节点不存在')
+    const query = all ? '?all=true' : ''
+    const resp = await dockerRequest('GET', `/containers/json${query}`, null, node.endpoint)
+    if (resp.status !== 200) throw new Error('获取容器列表失败')
+    return (resp.data || []).map(c => ({
+      id: c.Id?.slice(0, 12),
+      name: (c.Names?.[0] || '').replace(/^\//, ''),
+      image: c.Image,
+      state: c.State,
+      status: c.Status,
+      ports: (c.Ports || []).map(p => p.PublicPort ? `${p.PublicPort}→${p.PrivatePort}` : `${p.PrivatePort}`).join(', '),
+      created: c.Created,
+      nodeId: node.id, nodeName: node.name,
+    }))
+  },
+
+  async docker_create_container({ nodeId, name, image, tag = 'latest', panelPort = 1420, gatewayPort = 18789, envVars = {}, volume = true } = {}) {
+    const nodes = readDockerNodes()
+    const node = nodeId ? nodes.find(n => n.id === nodeId) : nodes[0]
+    if (!node) throw new Error('节点不存在')
+    const imgFull = `${image || OPENCLAW_IMAGE}:${tag}`
+    const containerName = name || `openclaw-${Date.now().toString(36)}`
+    const env = Object.entries(envVars).filter(([, v]) => v).map(([k, v]) => `${k}=${v}`)
+    const portBindings = {}
+    const exposedPorts = {}
+    if (panelPort) {
+      portBindings['1420/tcp'] = [{ HostPort: String(panelPort) }]
+      exposedPorts['1420/tcp'] = {}
+    }
+    if (gatewayPort) {
+      portBindings['18789/tcp'] = [{ HostPort: String(gatewayPort) }]
+      exposedPorts['18789/tcp'] = {}
+    }
+    const config = {
+      Image: imgFull,
+      Env: env,
+      ExposedPorts: exposedPorts,
+      HostConfig: {
+        PortBindings: portBindings,
+        RestartPolicy: { Name: 'unless-stopped' },
+        Binds: volume ? [`openclaw-data-${containerName}:/root/.openclaw`] : [],
+      },
+    }
+    const query = `?name=${encodeURIComponent(containerName)}`
+    const resp = await dockerRequest('POST', `/containers/create${query}`, config, node.endpoint)
+    if (resp.status === 404) {
+      // Image not found, need to pull first
+      throw new Error(`镜像 ${imgFull} 不存在，请先拉取`)
+    }
+    if (resp.status !== 201) throw new Error(resp.data?.message || '创建容器失败')
+    // Auto-start
+    const startResp = await dockerRequest('POST', `/containers/${resp.data.Id}/start`, null, node.endpoint)
+    if (startResp.status !== 204 && startResp.status !== 304) {
+      throw new Error('容器已创建但启动失败')
+    }
+    const containerId = resp.data.Id?.slice(0, 12)
+
+    // 自动注册为可管理实例
+    if (panelPort) {
+      const endpoint = `http://127.0.0.1:${panelPort}`
+      const instData = readInstances()
+      if (!instData.instances.find(i => i.endpoint === endpoint)) {
+        instData.instances.push({
+          id: `docker-${containerId}`,
+          name: containerName,
+          type: 'docker',
+          endpoint,
+          gatewayPort: gatewayPort || 18789,
+          containerId,
+          nodeId: node.id,
+          addedAt: Math.floor(Date.now() / 1000),
+          note: `Image: ${imgFull}`,
+        })
+        saveInstances(instData)
+      }
+    }
+
+    return { id: containerId, name: containerName, started: true, instanceId: `docker-${containerId}` }
+  },
+
+  async docker_start_container({ nodeId, containerId } = {}) {
+    const nodes = readDockerNodes()
+    const node = nodeId ? nodes.find(n => n.id === nodeId) : nodes[0]
+    if (!node) throw new Error('节点不存在')
+    const resp = await dockerRequest('POST', `/containers/${containerId}/start`, null, node.endpoint)
+    if (resp.status !== 204 && resp.status !== 304) throw new Error(resp.data?.message || '启动失败')
+    return true
+  },
+
+  async docker_stop_container({ nodeId, containerId } = {}) {
+    const nodes = readDockerNodes()
+    const node = nodeId ? nodes.find(n => n.id === nodeId) : nodes[0]
+    if (!node) throw new Error('节点不存在')
+    const resp = await dockerRequest('POST', `/containers/${containerId}/stop`, null, node.endpoint)
+    if (resp.status !== 204 && resp.status !== 304) throw new Error(resp.data?.message || '停止失败')
+    return true
+  },
+
+  async docker_restart_container({ nodeId, containerId } = {}) {
+    const nodes = readDockerNodes()
+    const node = nodeId ? nodes.find(n => n.id === nodeId) : nodes[0]
+    if (!node) throw new Error('节点不存在')
+    const resp = await dockerRequest('POST', `/containers/${containerId}/restart`, null, node.endpoint)
+    if (resp.status !== 204) throw new Error(resp.data?.message || '重启失败')
+    return true
+  },
+
+  async docker_remove_container({ nodeId, containerId, force = false } = {}) {
+    const nodes = readDockerNodes()
+    const node = nodeId ? nodes.find(n => n.id === nodeId) : nodes[0]
+    if (!node) throw new Error('节点不存在')
+    const query = force ? '?force=true&v=true' : '?v=true'
+    const resp = await dockerRequest('DELETE', `/containers/${containerId}${query}`, null, node.endpoint)
+    if (resp.status !== 204) throw new Error(resp.data?.message || '删除失败')
+
+    // 自动移除对应的实例注册
+    const instData = readInstances()
+    const instId = `docker-${containerId}`
+    const before = instData.instances.length
+    instData.instances = instData.instances.filter(i => i.id !== instId && i.containerId !== containerId)
+    if (instData.instances.length < before) {
+      if (instData.activeId === instId) instData.activeId = 'local'
+      saveInstances(instData)
+    }
+
+    return true
+  },
+
+  async docker_container_logs({ nodeId, containerId, tail = 200 } = {}) {
+    const nodes = readDockerNodes()
+    const node = nodeId ? nodes.find(n => n.id === nodeId) : nodes[0]
+    if (!node) throw new Error('节点不存在')
+    const resp = await dockerRequest('GET', `/containers/${containerId}/logs?stdout=true&stderr=true&tail=${tail}`, null, node.endpoint)
+    // Docker logs 返回带 stream header 的原始字节，简单清理
+    let logs = typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data)
+    // 去除 Docker stream 帧头（每 8 字节一个 header）
+    logs = logs.replace(/[\x00-\x08]/g, '').replace(/\r/g, '')
+    return logs
+  },
+
+  async docker_pull_image({ nodeId, image, tag = 'latest' } = {}) {
+    const nodes = readDockerNodes()
+    const node = nodeId ? nodes.find(n => n.id === nodeId) : nodes[0]
+    if (!node) throw new Error('节点不存在')
+    const imgFull = `${image || OPENCLAW_IMAGE}:${tag}`
+    const resp = await dockerRequest('POST', `/images/create?fromImage=${encodeURIComponent(image || OPENCLAW_IMAGE)}&tag=${tag}`, null, node.endpoint)
+    if (resp.status !== 200) throw new Error(resp.data?.message || '拉取镜像失败')
+    return `镜像 ${imgFull} 拉取完成`
+  },
+
+  async docker_list_images({ nodeId } = {}) {
+    const nodes = readDockerNodes()
+    const node = nodeId ? nodes.find(n => n.id === nodeId) : nodes[0]
+    if (!node) throw new Error('节点不存在')
+    const resp = await dockerRequest('GET', '/images/json', null, node.endpoint)
+    if (resp.status !== 200) throw new Error('获取镜像列表失败')
+    return (resp.data || [])
+      .filter(img => (img.RepoTags || []).some(t => t.includes('openclaw')))
+      .map(img => ({
+        id: img.Id?.replace('sha256:', '').slice(0, 12),
+        tags: img.RepoTags || [],
+        size: img.Size,
+        created: img.Created,
+      }))
+  },
+
+  // Docker 节点管理
+  docker_list_nodes() {
+    return readDockerNodes()
+  },
+
+  async docker_add_node({ name, endpoint }) {
+    if (!name || !endpoint) throw new Error('节点名称和地址不能为空')
+    // 验证连接
+    try {
+      await dockerRequest('GET', '/info', null, endpoint)
+    } catch (e) {
+      throw new Error(`无法连接到 ${endpoint}: ${e.message}`)
+    }
+    const nodes = readDockerNodes()
+    const id = 'node-' + Date.now().toString(36)
+    const type = endpoint.startsWith('tcp://') ? 'tcp' : 'socket'
+    nodes.push({ id, name, type, endpoint })
+    saveDockerNodes(nodes)
+    return { id, name, type, endpoint }
+  },
+
+  docker_remove_node({ nodeId }) {
+    if (nodeId === 'local') throw new Error('不能删除本机节点')
+    const nodes = readDockerNodes().filter(n => n.id !== nodeId)
+    saveDockerNodes(nodes)
+    return true
+  },
+
+  // 集群概览（聚合所有节点）
+  async docker_cluster_overview() {
+    const nodes = readDockerNodes()
+    const results = []
+    for (const node of nodes) {
+      try {
+        const infoResp = await dockerRequest('GET', '/info', null, node.endpoint)
+        const ctResp = await dockerRequest('GET', '/containers/json?all=true', null, node.endpoint)
+        const containers = (ctResp.data || []).map(c => ({
+          id: c.Id?.slice(0, 12),
+          name: (c.Names?.[0] || '').replace(/^\//, ''),
+          image: c.Image, state: c.State, status: c.Status,
+          ports: (c.Ports || []).map(p => p.PublicPort ? `${p.PublicPort}→${p.PrivatePort}` : `${p.PrivatePort}`).join(', '),
+        }))
+        const d = infoResp.data || {}
+        results.push({
+          ...node, online: true,
+          dockerVersion: d.ServerVersion, os: d.OperatingSystem,
+          cpus: d.NCPU, memory: d.MemTotal,
+          totalContainers: d.Containers, runningContainers: d.ContainersRunning,
+          stoppedContainers: d.ContainersStopped,
+          containers,
+        })
+      } catch (e) {
+        results.push({ ...node, online: false, error: e.message, containers: [] })
+      }
+    }
+    return results
+  },
+
+  // 部署模式检测
+  get_deploy_mode() {
+    const inDocker = fs.existsSync('/.dockerenv') || (process.env.CLAWPANEL_MODE === 'docker')
+    const dockerAvailable = isDockerAvailable()
+    return { inDocker, dockerAvailable, mode: inDocker ? 'docker' : 'local' }
+  },
+
   // 安装检测
   check_installation() {
-    return { installed: fs.existsSync(CONFIG_PATH), path: OPENCLAW_DIR, platform: isMac ? 'macos' : process.platform }
+    const inDocker = fs.existsSync('/.dockerenv')
+    return { installed: fs.existsSync(CONFIG_PATH), path: OPENCLAW_DIR, platform: isMac ? 'macos' : process.platform, inDocker }
   },
 
   check_node() {
@@ -1603,12 +2102,34 @@ const handlers = {
   check_panel_update() { return { latest: null, url: 'https://github.com/qingchencloud/clawpanel/releases' } },
 
   // 前端热更新
-  check_frontend_update() {
-    return { currentVersion: '0.6.0', latestVersion: '0.6.0', hasUpdate: false, compatible: true, updateReady: false, manifest: { version: '0.6.0', minAppVersion: '0.6.0' } }
+  async check_frontend_update() {
+    const pkgPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json')
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'))
+    const currentVersion = pkg.version
+
+    try {
+      const resp = await globalThis.fetch('https://claw.qt.cool/update/latest.json', {
+        signal: AbortSignal.timeout(8000),
+        headers: { 'User-Agent': 'ClawPanel-Web' },
+      })
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+      const manifest = await resp.json()
+      const latestVersion = manifest.version || ''
+      const minAppVersion = manifest.minAppVersion || '0.0.0'
+      const compatible = versionGe(currentVersion, minAppVersion)
+      const hasUpdate = !!latestVersion && latestVersion !== currentVersion && compatible && versionGt(latestVersion, currentVersion)
+      return { currentVersion, latestVersion, hasUpdate, compatible, updateReady: false, manifest }
+    } catch {
+      return { currentVersion, latestVersion: currentVersion, hasUpdate: false, compatible: true, updateReady: false, manifest: { version: currentVersion } }
+    }
   },
   download_frontend_update() { return { success: true, files: 12, path: path.join(OPENCLAW_DIR, 'clawpanel', 'web-update') } },
   rollback_frontend_update() { return { success: true } },
-  get_update_status() { return { currentVersion: '0.6.0', updateReady: false, updateVersion: '', updateDir: path.join(OPENCLAW_DIR, 'clawpanel', 'web-update') } },
+  get_update_status() {
+    const pkgPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json')
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'))
+    return { currentVersion: pkg.version, updateReady: false, updateVersion: '', updateDir: path.join(OPENCLAW_DIR, 'clawpanel', 'web-update') }
+  },
   write_env_file({ path: p, config }) {
     const expanded = p.startsWith('~/') ? path.join(homedir(), p.slice(2)) : p
     if (!expanded.startsWith(OPENCLAW_DIR)) throw new Error('只允许写入 ~/.openclaw/ 下的文件')
@@ -1808,6 +2329,22 @@ async function _apiMiddleware(req, res, next) {
     res.statusCode = 401
     res.setHeader('Content-Type', 'application/json')
     res.end(JSON.stringify({ error: '未登录', code: 'AUTH_REQUIRED' }))
+    return
+  }
+
+  // --- 实例代理：非 ALWAYS_LOCAL 命令，活跃实例非本机时代理转发 ---
+  const activeInst = getActiveInstance()
+  if (activeInst.type !== 'local' && activeInst.endpoint && !ALWAYS_LOCAL.has(cmd)) {
+    try {
+      const args = await readBody(req)
+      const result = await proxyToInstance(activeInst, cmd, args)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify(result))
+    } catch (e) {
+      res.statusCode = 502
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ error: `实例「${activeInst.name}」不可达: ${e.message}` }))
+    }
     return
   }
 
