@@ -639,15 +639,36 @@ function renderCompany(page) {
       <div style="font-size:var(--font-size-xs);color:var(--text-tertiary);line-height:1.6">
         ${t('about.companyDesc')}
       </div>
-      ${getLang() !== 'en' ? `<div style="margin-top:12px;padding:12px 14px;border-radius:var(--radius-md);border:1px dashed var(--border-primary);background:var(--bg-secondary);font-size:var(--font-size-xs);color:var(--text-tertiary)">
-        <div style="display:flex;align-items:center;gap:10px">
-          <img src="/images/bnbqr.jpg" alt="QR" width="60" height="60" style="border-radius:4px;flex-shrink:0;background:#fff;padding:2px" loading="lazy">
+      ${!getLang().startsWith('zh') ? `<div style="margin-top:12px;padding:12px 14px;border-radius:var(--radius-md);border:1px dashed var(--border-primary);background:var(--bg-secondary);font-size:var(--font-size-xs);color:var(--text-tertiary)">
+        <div style="display:flex;align-items:center;gap:12px">
+          <img src="/images/bnbqr.jpg" alt="Sponsor QR" width="64" height="64" style="border-radius:6px;flex-shrink:0;background:#fff;padding:2px;cursor:pointer" loading="lazy" id="sponsor-qr-thumb" title="Click to enlarge">
           <div style="min-width:0">
-            <div style="font-weight:600;color:var(--text-secondary);margin-bottom:4px">${t('about.sponsorProject') || '赞助项目'} <span style="opacity:0.5">(BNB Smart Chain)</span></div>
+            <div style="font-weight:600;color:var(--text-secondary);margin-bottom:4px">${t('about.sponsorProject') || 'Sponsor This Project'} <span style="opacity:0.5">· USDT (BNB Smart Chain)</span></div>
             <code style="font-size:10px;background:var(--bg-tertiary);padding:2px 6px;border-radius:4px;user-select:all;word-break:break-all;display:block;line-height:1.6">0xbdd7ebdf2b30d873e556799711021c6671ffe88f</code>
+            <div style="margin-top:4px;opacity:0.6">${t('about.sponsorDesc') || 'Your support helps us maintain and improve this open-source project.'}</div>
           </div>
         </div>
       </div>` : ''}
     </div>
   `
+  // QR 点击预览大图
+  el.querySelector('#sponsor-qr-thumb')?.addEventListener('click', () => {
+    const overlay = document.createElement('div')
+    overlay.className = 'modal-overlay'
+    overlay.innerHTML = `
+      <div class="modal" style="max-width:360px;text-align:center">
+        <div class="modal-title">${t('about.sponsorProject') || 'Sponsor This Project'}</div>
+        <img src="/images/bnbqr.jpg" alt="Sponsor QR" style="width:240px;height:240px;border-radius:8px;margin:12px auto;display:block">
+        <div style="font-size:var(--font-size-sm);color:var(--text-secondary);margin:8px 0">USDT · BNB Smart Chain</div>
+        <code style="font-size:11px;background:var(--bg-tertiary);padding:4px 8px;border-radius:4px;user-select:all;word-break:break-all;display:block;line-height:1.6">0xbdd7ebdf2b30d873e556799711021c6671ffe88f</code>
+        <div style="font-size:var(--font-size-xs);color:var(--text-tertiary);margin-top:8px">${t('about.sponsorDesc') || 'Your support helps us maintain and improve this open-source project.'}</div>
+        <div class="modal-actions" style="margin-top:16px">
+          <button class="btn btn-secondary btn-sm" data-action="close">${t('common.close')}</button>
+        </div>
+      </div>
+    `
+    document.body.appendChild(overlay)
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove() })
+    overlay.querySelector('[data-action="close"]').onclick = () => overlay.remove()
+  })
 }
