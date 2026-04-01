@@ -104,14 +104,7 @@ pub fn auto_pair_device() -> Result<String, String> {
 /// 将 Tauri 应用的 origin 写入 gateway.controlUi.allowedOrigins
 /// 避免 Gateway 因 origin not allowed 拒绝 WebSocket 握手
 fn patch_gateway_origins() {
-    let config_path = crate::commands::openclaw_dir().join("openclaw.json");
-    if !config_path.exists() {
-        return;
-    }
-    let Ok(content) = std::fs::read_to_string(&config_path) else {
-        return;
-    };
-    let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&content) else {
+    let Ok(mut config) = super::config::load_openclaw_json() else {
         return;
     };
 
@@ -154,9 +147,7 @@ fn patch_gateway_origins() {
         }
     }
 
-    if let Ok(new_json) = serde_json::to_string_pretty(&config) {
-        let _ = std::fs::write(&config_path, new_json);
-    }
+    let _ = super::config::save_openclaw_json(&config);
 }
 
 #[tauri::command]

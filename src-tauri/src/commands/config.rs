@@ -701,14 +701,9 @@ fn calibration_richness_score(config: &Value) -> usize {
         score += 4;
     }
     if config
-        .pointer("/auth/profiles")
-        .and_then(|v| v.as_object())
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
+        .pointer("/agents/defaults")
+        .is_some()
     {
-        score += 3;
-    }
-    if config.pointer("/agents/defaults").is_some() {
         score += 2;
     }
     if config
@@ -798,7 +793,6 @@ fn build_calibration_baseline() -> Value {
             "lastTouchedVersion": calibration_last_touched_version(),
         },
         "models": { "providers": {} },
-        "auth": { "profiles": {} },
         "agents": {
             "defaults": {
                 "workspace": calibration_default_workspace(),
@@ -901,17 +895,6 @@ fn normalize_calibrated_config(mut config: Value) -> Value {
         let providers = models_obj.entry("providers").or_insert_with(|| json!({}));
         if !providers.is_object() {
             *providers = json!({});
-        }
-    }
-
-    let auth = root.entry("auth").or_insert_with(|| json!({}));
-    if !auth.is_object() {
-        *auth = json!({});
-    }
-    if let Some(auth_obj) = auth.as_object_mut() {
-        let profiles = auth_obj.entry("profiles").or_insert_with(|| json!({}));
-        if !profiles.is_object() {
-            *profiles = json!({});
         }
     }
 
@@ -1207,13 +1190,14 @@ const KNOWN_UI_FIELDS: &[&str] = &[
     "latency",
     "testStatus",
     "testError",
+    "profiles",
 ];
 
 /// 已知需要保留的合法 OpenClaw 配置字段（用于诊断报告）
 /// 这些字段虽然不在标准列表中，但不应被警告为未知字段
 /// 注意：这些字段在 `merge_configs_preserving_fields` 中会被特殊处理
 #[allow(dead_code)]
-const KNOWN_LEGAL_FIELDS: &[&str] = &["browser", "profiles", "agents", "gateway", "logging", "mcp"];
+const KNOWN_LEGAL_FIELDS: &[&str] = &["browser", "agents", "gateway", "logging", "mcp"];
 
 // KNOWN_LEGAL_FIELDS 目前在诊断逻辑中使用，用于生成报告信息
 
@@ -1326,7 +1310,7 @@ pub fn validate_openclaw_config() -> Result<Value, String> {
                     // 检查 agents 子字段（上游 schema 只定义 agents.list）
                     if agents_obj.contains_key("profiles") {
                         warnings.push(
-                            "发现 agents.profiles 字段，上游 schema 未定义此字段，将保留但建议核实"
+                            "发现 agents.profiles 字段，上游 schema 未定义此字段，ClawPanel 会自动清理"
                                 .to_string(),
                         );
                     }
@@ -1555,6 +1539,39 @@ fn sync_providers_to_agent_models(config: &Value) {
 /// 检测配置中是否包含 UI 专属字段
 fn has_ui_fields(val: &Value) -> bool {
     if let Some(obj) = val.as_object() {
+        for key in &[
+            "current",
+            "latest",
+            "recommended",
+            "update_available",
+            "latest_update_available",
+            "is_recommended",
+            "ahead_of_recommended",
+            "panel_version",
+            "source",
+            "qqbot",
+            "profiles",
+        ] {
+            if obj.contains_key(*key) {
+                return true;
+            }
+        }
+        if obj
+            .get("auth")
+            .and_then(|v| v.as_object())
+            .map(|auth| auth.contains_key("profiles"))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if obj
+            .get("agents")
+            .and_then(|v| v.as_object())
+            .map(|agents| agents.contains_key("profiles"))
+            .unwrap_or(false)
+        {
+            return true;
+        }
         if let Some(models_val) = obj.get("models") {
             if let Some(models_obj) = models_val.as_object() {
                 if let Some(providers_val) = models_obj.get("providers") {
@@ -1612,8 +1629,14 @@ fn strip_ui_fields(mut val: Value) -> Value {
             "source",
             // 渠道插件别名：OpenClaw schema 不承认 qqbot 作为根键（应写在 channels.qqbot）
             "qqbot",
+            "profiles",
         ] {
             obj.remove(*key);
+        }
+        if let Some(auth_val) = obj.get_mut("auth") {
+            if let Some(auth_obj) = auth_val.as_object_mut() {
+                auth_obj.remove("profiles");
+            }
         }
         // 处理 models.providers.xxx.models 结构
         if let Some(models_val) = obj.get_mut("models") {
@@ -1651,6 +1674,7 @@ fn strip_ui_fields(mut val: Value) -> Value {
         // 递归处理 agents 数组中的元素（保留 agents.list 等合法字段）
         if let Some(agents_val) = obj.get_mut("agents") {
             if let Some(agents_obj) = agents_val.as_object_mut() {
+                agents_obj.remove("profiles");
                 // 保留 agents 子字段不做修改
                 // 只清理 agents 数组中的元素（如果有 UI 字段）
                 if let Some(Value::Array(arr)) = agents_obj.get_mut("list") {

@@ -1146,15 +1146,30 @@ function getUid() {
 }
 
 function stripUiFields(config) {
+  if (!config || typeof config !== 'object' || Array.isArray(config)) return config
   // 清理根层级 ClawPanel 内部字段（version info 等），避免污染 openclaw.json
   // Issue #89: 这些字段被写入 openclaw.json 后导致 Gateway 无法启动（Unknown config keys）
   const uiRootKeys = [
     'current', 'latest', 'recommended', 'update_available',
     'latest_update_available', 'is_recommended', 'ahead_of_recommended',
-    'panel_version', 'source',
+    'panel_version', 'source', 'qqbot', 'profiles',
   ]
   for (const key of uiRootKeys) {
     delete config[key]
+  }
+  if (config.auth && typeof config.auth === 'object' && !Array.isArray(config.auth)) {
+    delete config.auth.profiles
+  }
+  if (config.agents && typeof config.agents === 'object' && !Array.isArray(config.agents)) {
+    delete config.agents.profiles
+    if (Array.isArray(config.agents.list)) {
+      for (const agent of config.agents.list) {
+        if (!agent || typeof agent !== 'object' || Array.isArray(agent)) continue
+        delete agent.current
+        delete agent.latest
+        delete agent.update_available
+      }
+    }
   }
   // 清理模型测试相关的临时字段
   const providers = config?.models?.providers
@@ -1172,6 +1187,15 @@ function stripUiFields(config) {
     }
   }
   return config
+}
+
+function cleanLoadedConfig(config) {
+  const before = JSON.stringify(config)
+  const cleaned = stripUiFields(config)
+  if (fs.existsSync(CONFIG_PATH) && JSON.stringify(cleaned) !== before) {
+    writeOpenclawConfigFile(cleaned)
+  }
+  return cleaned
 }
 
 // === Ed25519 设备密钥管理 ===
@@ -1287,7 +1311,6 @@ function calibrationRichnessScore(config) {
   if (!config || typeof config !== 'object' || Array.isArray(config)) return 0
   let score = 0
   if (config.models?.providers && Object.keys(config.models.providers).length) score += 4
-  if (config.auth?.profiles && Object.keys(config.auth.profiles).length) score += 3
   if (config.agents?.defaults) score += 2
   if (Array.isArray(config.agents?.list) && config.agents.list.length) score += 3
   if (config.channels && Object.keys(config.channels).length) score += 2
@@ -1316,7 +1339,6 @@ function buildCalibrationBaseline() {
     $schema: 'https://openclaw.ai/schema/config.json',
     meta: { lastTouchedVersion: calibrationLastTouchedVersion() },
     models: { providers: {} },
-    auth: { profiles: {} },
     agents: {
       defaults: { workspace: calibrationDefaultWorkspace() },
       list: [],
@@ -1381,9 +1403,6 @@ function normalizeCalibratedConfig(input) {
 
   config.models = config.models && typeof config.models === 'object' && !Array.isArray(config.models) ? config.models : {}
   config.models.providers = config.models.providers && typeof config.models.providers === 'object' && !Array.isArray(config.models.providers) ? config.models.providers : {}
-
-  config.auth = config.auth && typeof config.auth === 'object' && !Array.isArray(config.auth) ? config.auth : {}
-  config.auth.profiles = config.auth.profiles && typeof config.auth.profiles === 'object' && !Array.isArray(config.auth.profiles) ? config.auth.profiles : {}
 
   config.agents = config.agents && typeof config.agents === 'object' && !Array.isArray(config.agents) ? config.agents : {}
   config.agents.defaults = config.agents.defaults && typeof config.agents.defaults === 'object' && !Array.isArray(config.agents.defaults) ? config.agents.defaults : {}
@@ -1571,18 +1590,18 @@ function patchGatewayOrigins() {
   if (!config.gateway) config.gateway = {}
   if (!config.gateway.controlUi) config.gateway.controlUi = {}
   config.gateway.controlUi.allowedOrigins = merged
-  fs.copyFileSync(CONFIG_PATH, CONFIG_PATH + '.bak')
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2))
+  writeOpenclawConfigFile(config)
   return true
 }
 
 function readOpenclawConfigOptional() {
-  return fs.existsSync(CONFIG_PATH) ? JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')) : {}
+  if (!fs.existsSync(CONFIG_PATH)) return {}
+  return cleanLoadedConfig(JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')))
 }
 
 function readOpenclawConfigRequired() {
   if (!fs.existsSync(CONFIG_PATH)) throw new Error('openclaw.json 不存在')
-  return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'))
+  return cleanLoadedConfig(JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')))
 }
 
 function mergeConfigsPreservingFields(existing, next) {
@@ -1601,8 +1620,9 @@ function mergeConfigsPreservingFields(existing, next) {
 }
 
 function writeOpenclawConfigFile(config) {
+  const cleaned = stripUiFields(config)
   if (fs.existsSync(CONFIG_PATH)) fs.copyFileSync(CONFIG_PATH, CONFIG_PATH + '.bak')
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2))
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(cleaned, null, 2))
 }
 
 function ensureAgentsList(config) {
@@ -2690,9 +2710,7 @@ function serverCached(key, ttlMs, fn) {
 const handlers = {
   // 配置读写
   read_openclaw_config() {
-    if (!fs.existsSync(CONFIG_PATH)) throw new Error('openclaw.json 不存在，请先安装 OpenClaw')
-    const content = fs.readFileSync(CONFIG_PATH, 'utf8')
-    return JSON.parse(content)
+    return readOpenclawConfigRequired()
   },
 
   calibrate_openclaw_config({ mode } = {}) {
@@ -4837,7 +4855,7 @@ const handlers = {
     const src = path.join(BACKUPS_DIR, name)
     if (!fs.existsSync(src)) throw new Error('备份不存在')
     if (fs.existsSync(CONFIG_PATH)) handlers.create_backup()
-    fs.copyFileSync(src, CONFIG_PATH)
+    writeOpenclawConfigFile(JSON.parse(fs.readFileSync(src, 'utf8')))
     return true
   },
 
@@ -4866,8 +4884,7 @@ const handlers = {
       }
     }
     if (changed) {
-      fs.copyFileSync(CONFIG_PATH, CONFIG_PATH + '.bak')
-      fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2))
+      writeOpenclawConfigFile(config)
     }
     return changed
   },
@@ -5009,12 +5026,11 @@ const handlers = {
     const backupPath = CONFIG_PATH + '.bak'
     if (fs.existsSync(backupPath)) {
       const backupContent = fs.readFileSync(backupPath, 'utf8')
-      JSON.parse(backupContent)
-      fs.writeFileSync(CONFIG_PATH, backupContent)
+      writeOpenclawConfigFile(JSON.parse(backupContent))
       return { created: false, restored: true, message: '已从 openclaw.json.bak 恢复配置文件' }
     }
     const defaultConfig = stripUiFields(normalizeCalibratedConfig(buildCalibrationBaseline()))
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(defaultConfig, null, 2))
+    writeOpenclawConfigFile(defaultConfig)
     return { created: true, restored: false, message: '配置文件已创建' }
   },
 

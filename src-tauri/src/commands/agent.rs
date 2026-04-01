@@ -5,6 +5,7 @@ use serde_json::json;
 use serde_json::Value;
 use std::fs;
 use std::io::Write;
+use std::path::{Component, Path, PathBuf};
 
 const AGENT_FILE_ALLOWLIST: &[&str] = &[
     "AGENTS.md",
@@ -16,6 +17,32 @@ const AGENT_FILE_ALLOWLIST: &[&str] = &[
     "BOOTSTRAP.md",
     "MEMORY.md",
 ];
+
+const WORKSPACE_TEXT_EXTENSIONS: &[&str] = &[
+    "md", "markdown", "mdx", "txt", "json", "jsonc", "yaml", "yml", "toml", "ini",
+    "cfg", "conf", "log", "csv", "env", "gitignore", "gitattributes", "editorconfig",
+    "js", "mjs", "cjs", "ts", "tsx", "jsx", "html", "htm", "css", "scss", "less",
+    "rs", "py", "sh", "bash", "zsh", "fish", "ps1", "bat", "cmd", "sql", "xml",
+    "java", "kt", "go", "rb", "php", "c", "cc", "cpp", "h", "hpp", "vue", "svelte",
+    "lock", "sample",
+];
+
+const WORKSPACE_TEXT_BASENAMES: &[&str] = &[
+    "dockerfile",
+    "makefile",
+    "readme",
+    "license",
+    ".env",
+    ".env.local",
+    ".env.example",
+    ".gitignore",
+    ".gitattributes",
+    ".editorconfig",
+    ".npmrc",
+];
+
+const WORKSPACE_PREVIEW_EXTENSIONS: &[&str] = &["md", "markdown", "mdx"];
+const MAX_WORKSPACE_FILE_SIZE: u64 = 1024 * 1024;
 
 /// Workspace 状态信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,13 +132,7 @@ fn check_workspace_status(path: &std::path::Path) -> WorkspaceCheckResult {
 /// 获取 agent 列表（直接读 openclaw.json，不走 CLI，毫秒级响应）
 #[tauri::command]
 pub async fn list_agents() -> Result<Value, String> {
-    let config_path = super::openclaw_dir().join("openclaw.json");
-    if !config_path.exists() {
-        return Err("openclaw.json 不存在，请先安装 OpenClaw".to_string());
-    }
-    let content = fs::read_to_string(&config_path).map_err(|e| format!("读取配置失败: {e}"))?;
-    let config: Value =
-        serde_json::from_str(&content).map_err(|e| format!("解析 JSON 失败: {e}"))?;
+    let config = super::config::load_openclaw_json()?;
 
     let agents_list = config
         .get("agents")
@@ -224,10 +245,7 @@ pub async fn list_agents() -> Result<Value, String> {
 
 #[tauri::command]
 pub async fn get_agent_detail(id: String) -> Result<Value, String> {
-    let config_path = super::openclaw_dir().join("openclaw.json");
-    let content = fs::read_to_string(&config_path).map_err(|e| format!("读取配置失败: {e}"))?;
-    let config: Value =
-        serde_json::from_str(&content).map_err(|e| format!("解析 JSON 失败: {e}"))?;
+    let config = super::config::load_openclaw_json()?;
 
     let defaults = config
         .get("agents")
@@ -251,11 +269,9 @@ pub async fn get_agent_detail(id: String) -> Result<Value, String> {
         })
         .unwrap_or_else(|| json!({ "id": id.clone(), "default": id == "main" }));
 
-    let workspace = agent
-        .get("workspace")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| resolve_agent_workspace(&id, &config));
+    let workspace = resolve_agent_workspace_path(&id, &config)
+        .to_string_lossy()
+        .to_string();
 
     let agent_bindings: Vec<Value> = bindings
         .into_iter()
@@ -279,12 +295,12 @@ pub async fn get_agent_detail(id: String) -> Result<Value, String> {
 
 #[tauri::command]
 pub async fn list_agent_files(id: String) -> Result<Value, String> {
-    let config = read_openclaw_config_value()?;
-    let agent_dir = resolve_agent_dir(&id, &config);
+    let config = super::config::load_openclaw_json()?;
+    let workspace_dir = resolve_agent_workspace_path(&id, &config);
     let files: Vec<Value> = AGENT_FILE_ALLOWLIST
         .iter()
         .map(|name| {
-            let path = agent_dir.join(name);
+            let path = workspace_dir.join(name);
             let meta = fs::metadata(&path).ok();
             json!({
                 "name": name,
@@ -302,8 +318,8 @@ pub async fn list_agent_files(id: String) -> Result<Value, String> {
 #[tauri::command]
 pub async fn read_agent_file(id: String, name: String) -> Result<Value, String> {
     ensure_allowed_agent_file(&name)?;
-    let config = read_openclaw_config_value()?;
-    let path = resolve_agent_dir(&id, &config).join(&name);
+    let config = super::config::load_openclaw_json()?;
+    let path = resolve_agent_workspace_path(&id, &config).join(&name);
     if !path.exists() {
         return Ok(json!({ "exists": false, "content": "" }));
     }
@@ -314,8 +330,8 @@ pub async fn read_agent_file(id: String, name: String) -> Result<Value, String> 
 #[tauri::command]
 pub async fn write_agent_file(id: String, name: String, content: String) -> Result<Value, String> {
     ensure_allowed_agent_file(&name)?;
-    let config = read_openclaw_config_value()?;
-    let dir = resolve_agent_dir(&id, &config);
+    let config = super::config::load_openclaw_json()?;
+    let dir = resolve_agent_workspace_path(&id, &config);
     if !dir.exists() {
         fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
     }
@@ -324,16 +340,153 @@ pub async fn write_agent_file(id: String, name: String, content: String) -> Resu
 }
 
 #[tauri::command]
+pub async fn get_agent_workspace_info(id: String) -> Result<Value, String> {
+    let config = super::config::load_openclaw_json()?;
+    let workspace_dir = resolve_agent_workspace_path(&id, &config);
+    Ok(json!({
+        "agentId": id,
+        "workspacePath": workspace_dir.to_string_lossy().to_string(),
+        "exists": workspace_dir.exists(),
+        "isDefault": id == "main",
+    }))
+}
+
+#[tauri::command]
+pub async fn list_agent_workspace_entries(
+    id: String,
+    relative_path: Option<String>,
+) -> Result<Value, String> {
+    let config = super::config::load_openclaw_json()?;
+    let workspace_dir = resolve_agent_workspace_path(&id, &config);
+    if !workspace_dir.exists() {
+        return Ok(Value::Array(Vec::new()));
+    }
+
+    let target_dir = resolve_workspace_target_path(&workspace_dir, relative_path.as_deref())?;
+    if !target_dir.exists() {
+        return Err("目录不存在".to_string());
+    }
+    if !target_dir.is_dir() {
+        return Err("目标不是目录".to_string());
+    }
+
+    let mut items: Vec<(u8, String, Value)> = fs::read_dir(&target_dir)
+        .map_err(|e| format!("读取目录失败: {e}"))?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            let meta = entry.metadata().ok()?;
+            let is_dir = meta.is_dir();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let relative = to_workspace_relative_path(&workspace_dir, &path);
+            let mtime = meta
+                .modified()
+                .ok()
+                .map(|m| chrono::DateTime::<chrono::Utc>::from(m).to_rfc3339());
+
+            Some((
+                if is_dir { 0 } else { 1 },
+                name.to_lowercase(),
+                json!({
+                    "name": name,
+                    "relativePath": relative,
+                    "type": if is_dir { "dir" } else { "file" },
+                    "size": if is_dir { 0 } else { meta.len() },
+                    "mtime": mtime,
+                    "editable": !is_dir && is_workspace_text_file(&path),
+                    "previewable": !is_dir && is_workspace_previewable_file(&path),
+                }),
+            ))
+        })
+        .collect();
+
+    items.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    Ok(Value::Array(items.into_iter().map(|(_, _, item)| item).collect()))
+}
+
+#[tauri::command]
+pub async fn read_agent_workspace_file(
+    id: String,
+    relative_path: String,
+) -> Result<Value, String> {
+    let config = super::config::load_openclaw_json()?;
+    let workspace_dir = resolve_agent_workspace_path(&id, &config);
+    let normalized = normalize_workspace_relative_path(&relative_path)?;
+    if normalized.as_os_str().is_empty() {
+        return Err("文件路径不能为空".to_string());
+    }
+
+    let file_path = workspace_dir.join(&normalized);
+    if !file_path.exists() {
+        return Err("文件不存在".to_string());
+    }
+    if !file_path.is_file() {
+        return Err("目标不是文件".to_string());
+    }
+
+    let meta = fs::metadata(&file_path).map_err(|e| format!("读取文件信息失败: {e}"))?;
+    if meta.len() > MAX_WORKSPACE_FILE_SIZE {
+        return Err("文件过大，暂不支持在面板中打开".to_string());
+    }
+
+    let mtime = meta
+        .modified()
+        .ok()
+        .map(|m| chrono::DateTime::<chrono::Utc>::from(m).to_rfc3339());
+
+    let bytes = fs::read(&file_path).map_err(|e| format!("读取文件失败: {e}"))?;
+    if looks_binary_bytes(&bytes) {
+        return Err("暂不支持在面板中打开二进制文件".to_string());
+    }
+
+    let content = String::from_utf8(bytes)
+        .map_err(|_| "暂不支持在面板中打开非 UTF-8 文本文件".to_string())?;
+
+    Ok(json!({
+        "relativePath": normalized.to_string_lossy().replace('\\', "/"),
+        "path": file_path.to_string_lossy().to_string(),
+        "size": meta.len(),
+        "mtime": mtime,
+        "editable": true,
+        "previewable": is_workspace_previewable_file(&file_path),
+        "content": content,
+    }))
+}
+
+#[tauri::command]
+pub async fn write_agent_workspace_file(
+    id: String,
+    relative_path: String,
+    content: String,
+) -> Result<Value, String> {
+    let config = super::config::load_openclaw_json()?;
+    let workspace_dir = resolve_agent_workspace_path(&id, &config);
+    let normalized = normalize_workspace_relative_path(&relative_path)?;
+    if normalized.as_os_str().is_empty() {
+        return Err("文件路径不能为空".to_string());
+    }
+
+    let file_path = workspace_dir.join(&normalized);
+    if let Some(parent) = file_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
+    }
+
+    fs::write(&file_path, content.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))?;
+
+    Ok(json!({
+        "ok": true,
+        "relativePath": normalized.to_string_lossy().replace('\\', "/"),
+        "size": content.as_bytes().len(),
+    }))
+}
+
+#[tauri::command]
 pub async fn update_agent_config(
     app: tauri::AppHandle,
     id: String,
     config: Value,
 ) -> Result<Value, String> {
-    let path = super::openclaw_dir().join("openclaw.json");
-    let content = fs::read_to_string(&path).map_err(|e| format!("读取配置失败: {e}"))?;
-    let mut root: Value =
-        serde_json::from_str(&content).map_err(|e| format!("解析 JSON 失败: {e}"))?;
-
+    let mut root = super::config::load_openclaw_json()?;
     if root.get("agents").is_none() {
         root.as_object_mut()
             .ok_or("配置格式错误")?
@@ -414,9 +567,11 @@ pub async fn update_agent_config(
         }
     }
 
-    let json_text = serde_json::to_string_pretty(&root).map_err(|e| format!("序列化失败: {e}"))?;
-    fs::write(&path, json_text).map_err(|e| format!("写入配置失败: {e}"))?;
-    let _ = super::config::do_reload_gateway(&app).await;
+    super::config::save_openclaw_json(&root)?;
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = super::config::do_reload_gateway(&app2).await;
+    });
     Ok(json!({ "ok": true }))
 }
 
@@ -530,14 +685,7 @@ pub async fn add_agent(
 
 /// 直接写 openclaw.json 创建 agent（CLI 不可用时的兜底方案）
 fn add_agent_to_config(id: &str, model: &str, workspace: &std::path::Path) -> Result<(), String> {
-    let config_path = super::openclaw_dir().join("openclaw.json");
-    if !config_path.exists() {
-        return Err("openclaw.json 不存在，请先安装 OpenClaw".to_string());
-    }
-    let content = fs::read_to_string(&config_path).map_err(|e| format!("读取配置失败: {e}"))?;
-    let mut config: Value =
-        serde_json::from_str(&content).map_err(|e| format!("解析 JSON 失败: {e}"))?;
-
+    let mut config = super::config::load_openclaw_json()?;
     // 确保 agents.list 存在
     if config.get("agents").is_none() {
         config
@@ -576,11 +724,7 @@ fn add_agent_to_config(id: &str, model: &str, workspace: &std::path::Path) -> Re
     }
     list.push(agent);
 
-    // 备份 + 写回
-    let bak = super::openclaw_dir().join("openclaw.json.bak");
-    let _ = fs::copy(&config_path, &bak);
-    let json = serde_json::to_string_pretty(&config).map_err(|e| format!("序列化失败: {e}"))?;
-    fs::write(&config_path, json).map_err(|e| format!("写入配置失败: {e}"))?;
+    super::config::save_openclaw_json(&config)?;
 
     Ok(())
 }
@@ -593,32 +737,23 @@ pub async fn delete_agent(app: tauri::AppHandle, id: String) -> Result<String, S
     }
 
     // 1. 从 openclaw.json 的 agents.list 中移除
-    let config_path = super::openclaw_dir().join("openclaw.json");
-    if config_path.exists() {
-        let content = fs::read_to_string(&config_path).map_err(|e| format!("读取配置失败: {e}"))?;
-        let mut config: Value =
-            serde_json::from_str(&content).map_err(|e| format!("解析 JSON 失败: {e}"))?;
-        if let Some(list) = config
-            .get_mut("agents")
-            .and_then(|a| a.get_mut("list"))
-            .and_then(|l| l.as_array_mut())
-        {
-            list.retain(|a| a.get("id").and_then(|v| v.as_str()) != Some(&id));
-        }
-        // 同时清理 agents.profiles 中的配置
-        if let Some(profiles) = config
-            .get_mut("agents")
-            .and_then(|a| a.get_mut("profiles"))
-            .and_then(|p| p.as_object_mut())
-        {
-            profiles.remove(&id);
-        }
-        // 备份 + 写回
-        let bak = super::openclaw_dir().join("openclaw.json.bak");
-        let _ = fs::copy(&config_path, &bak);
-        let json = serde_json::to_string_pretty(&config).map_err(|e| format!("序列化失败: {e}"))?;
-        fs::write(&config_path, &json).map_err(|e| format!("写入失败: {e}"))?;
+    let mut config = super::config::load_openclaw_json()?;
+    if let Some(list) = config
+        .get_mut("agents")
+        .and_then(|a| a.get_mut("list"))
+        .and_then(|l| l.as_array_mut())
+    {
+        list.retain(|a| a.get("id").and_then(|v| v.as_str()) != Some(&id));
     }
+    // 同时清理 agents.profiles 中的配置
+    if let Some(profiles) = config
+        .get_mut("agents")
+        .and_then(|a| a.get_mut("profiles"))
+        .and_then(|p| p.as_object_mut())
+    {
+        profiles.remove(&id);
+    }
+    super::config::save_openclaw_json(&config)?;
 
     // 2. 删除 agent 目录（workspace + sessions 等）
     let agent_dir = super::openclaw_dir().join("agents").join(&id);
@@ -642,11 +777,7 @@ pub async fn update_agent_identity(
     name: Option<String>,
     emoji: Option<String>,
 ) -> Result<String, String> {
-    let path = super::openclaw_dir().join("openclaw.json");
-    let content = fs::read_to_string(&path).map_err(|e| format!("读取配置失败: {e}"))?;
-    let mut config: Value =
-        serde_json::from_str(&content).map_err(|e| format!("解析 JSON 失败: {e}"))?;
-
+    let mut config = super::config::load_openclaw_json()?;
     let agents_list = config
         .get_mut("agents")
         .and_then(|a| a.get_mut("list"))
@@ -696,10 +827,7 @@ pub async fn update_agent_identity(
                 .map(|s| s.to_string())
         });
 
-    let json = serde_json::to_string_pretty(&config).map_err(|e| format!("序列化失败: {e}"))?;
-    if let Err(e) = fs::write(&path, json) {
-        return Err(format!("写入配置失败: {e}，请检查文件权限"));
-    }
+    super::config::save_openclaw_json(&config)?;
 
     // 删除 IDENTITY.md 文件，让配置文件生效
     if let Some(ws_str) = workspace_path {
@@ -774,11 +902,7 @@ pub async fn update_agent_model(
     id: String,
     model: String,
 ) -> Result<String, String> {
-    let path = super::openclaw_dir().join("openclaw.json");
-    let content = fs::read_to_string(&path).map_err(|e| format!("读取配置失败: {e}"))?;
-    let mut config: Value =
-        serde_json::from_str(&content).map_err(|e| format!("解析 JSON 失败: {e}"))?;
-
+    let mut config = super::config::load_openclaw_json()?;
     let agents_list = config
         .get_mut("agents")
         .and_then(|a| a.get_mut("list"))
@@ -796,21 +920,12 @@ pub async fn update_agent_model(
         .ok_or("Agent 格式错误")?
         .insert("model".to_string(), model_obj);
 
-    let json = serde_json::to_string_pretty(&config).map_err(|e| format!("序列化失败: {e}"))?;
-    if let Err(e) = fs::write(&path, json) {
-        return Err(format!("写入配置失败: {e}，请检查文件权限"));
-    }
+    super::config::save_openclaw_json(&config)?;
 
     // 触发 Gateway 重载使配置生效
     let _ = super::config::do_reload_gateway(&app).await;
 
     Ok("已更新".into())
-}
-
-fn read_openclaw_config_value() -> Result<Value, String> {
-    let path = super::openclaw_dir().join("openclaw.json");
-    let content = fs::read_to_string(&path).map_err(|e| format!("读取配置失败: {e}"))?;
-    serde_json::from_str(&content).map_err(|e| format!("解析 JSON 失败: {e}"))
 }
 
 fn resolve_agent_workspace(id: &str, config: &Value) -> String {
@@ -823,6 +938,8 @@ fn resolve_agent_workspace(id: &str, config: &Value) -> String {
                 .find(|a| a.get("id").and_then(|v| v.as_str()) == Some(id))
                 .and_then(|a| a.get("workspace"))
                 .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
         })
         .unwrap_or_else(|| {
@@ -842,25 +959,94 @@ fn resolve_agent_workspace(id: &str, config: &Value) -> String {
         })
 }
 
-fn resolve_agent_dir(id: &str, config: &Value) -> std::path::PathBuf {
-    let custom_dir = config
-        .get("agents")
-        .and_then(|a| a.get("list"))
-        .and_then(|l| l.as_array())
-        .and_then(|list| {
-            list.iter()
-                .find(|a| a.get("id").and_then(|v| v.as_str()) == Some(id))
-                .and_then(|a| a.get("agentDir"))
-                .and_then(|v| v.as_str())
-                .map(std::path::PathBuf::from)
-        });
-    custom_dir.unwrap_or_else(|| {
-        if id == "main" {
-            super::openclaw_dir()
-        } else {
-            super::openclaw_dir().join("agents").join(id)
+fn expand_user_path(raw: &str) -> std::path::PathBuf {
+    let trimmed = raw.trim();
+    let path = if let Some(rest) = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix("~\\"))
+    {
+        dirs::home_dir().unwrap_or_default().join(rest)
+    } else {
+        std::path::PathBuf::from(trimmed)
+    };
+
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&path))
+            .unwrap_or(path)
+    }
+}
+
+fn resolve_agent_workspace_path(id: &str, config: &Value) -> std::path::PathBuf {
+    expand_user_path(&resolve_agent_workspace(id, config))
+}
+
+fn normalize_workspace_relative_path(raw: &str) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(PathBuf::new());
+    }
+
+    let path = PathBuf::from(trimmed);
+    if path.is_absolute() {
+        return Err("不允许使用绝对路径".to_string());
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(seg) => normalized.push(seg),
+            Component::CurDir => {}
+            Component::ParentDir => return Err("不允许访问工作区外部路径".to_string()),
+            Component::RootDir | Component::Prefix(_) => {
+                return Err("不允许使用绝对路径".to_string())
+            }
         }
-    })
+    }
+    Ok(normalized)
+}
+
+fn resolve_workspace_target_path(root: &Path, relative_path: Option<&str>) -> Result<PathBuf, String> {
+    let normalized = normalize_workspace_relative_path(relative_path.unwrap_or_default())?;
+    Ok(root.join(normalized))
+}
+
+fn to_workspace_relative_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(seg) => Some(seg.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn is_workspace_text_file(path: &Path) -> bool {
+    if let Some(ext) = path.extension().and_then(|ext| ext.to_str()) {
+        if WORKSPACE_TEXT_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()) {
+            return true;
+        }
+    }
+
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| WORKSPACE_TEXT_BASENAMES.contains(&name.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+fn is_workspace_previewable_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| WORKSPACE_PREVIEW_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+fn looks_binary_bytes(bytes: &[u8]) -> bool {
+    bytes.iter().take(512).any(|b| *b == 0)
 }
 
 fn ensure_allowed_agent_file(name: &str) -> Result<(), String> {
