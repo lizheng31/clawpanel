@@ -101,7 +101,10 @@ fn panel_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-fn find_panel_policy_entry<'a>(policy: &'a VersionPolicy, current_version: &str) -> Option<&'a VersionPolicyEntry> {
+fn find_panel_policy_entry<'a>(
+    policy: &'a VersionPolicy,
+    current_version: &str,
+) -> Option<&'a VersionPolicyEntry> {
     if let Some(entry) = policy.panels.get(current_version) {
         return Some(entry);
     }
