@@ -730,39 +730,33 @@ function applyDefaultModel(state) {
   ensureValidPrimary(state)
   const primary = getCurrentPrimary(state.config)
 
-  // 确保 defaults.model 存在
+  // Ensure defaults.model exists
   const defaults = state.config.agents.defaults
   if (!defaults.model) defaults.model = {}
 
-  // 只同步 primary，不自动重写 fallbacks / models
-  // ———————————————————————————————————————————
-  // 原逻辑会把所有非主模型强制塞进 fallbacks 并重建 defaults.models，
-  // 导致用户精心维护的精简 fallback 链被覆盖，且随模型增多而不断膨胀，
-  // 可能引起频繁 failover 卡顿（参考 https://github.com/qingchencloud/clawpanel/issues/190）
-  //
-  // 保留 primary 同步（确保主模型始终有效）；
-  // fallback 由用户自行在 openclaw.json 中维护，ClawPanel 不再主动干预。
-  // ———————————————————————————————————————————
+  // Always sync primary (unchanged — ensures primary is always valid)
   defaults.model.primary = primary
 
-  // 如 model 对象尚未初始化 fallbacks / models，再初始化一次（首次安装时友好）
-  if (!defaults.model.fallbacks) {
-    const allModels = collectAllModels(state.config)
-    const fallbacks = allModels.filter(m => m.full !== primary).map(m => m.full)
-    defaults.model.fallbacks = fallbacks
-  }
-  if (!defaults.model.models) {
-    const allModels = collectAllModels(state.config)
-    const fallbacks = allModels.filter(m => m.full !== primary).map(m => m.full)
-    const modelsMap = {}
-    modelsMap[primary] = {}
-    for (const fb of fallbacks) modelsMap[fb] = {}
-    defaults.model.models = modelsMap
+  // --- fallbacks: NEVER auto-overwrite ---
+  // Keep user-managed fallbacks intact; panel never touches this.
+  // (The original bug overwrote fallbacks on every save, causing the
+  // curated fallback chain to be replaced with ALL non-primary models
+  // on every action. Ref: https://github.com/qingchencloud/clawpanel/issues/190)
+
+  // --- defaults.models: always rebuild from providers ---
+  // Unlike fallbacks, the models registry must stay in sync with
+  // whatever providers are configured, so the panel shows all available
+  // models. Rebuild it every save; this does NOT cause fallback pollution.
+  if (!defaults.model.models) defaults.model.models = {}
+  const modelsMap = defaults.model.models
+  if (primary) modelsMap[primary] = {}
+  const allModels = collectAllModels(state.config)
+  for (const m of allModels) {
+    if (m.full !== primary) modelsMap[m.full] = {}
   }
 
-  // 注意：不再强制同步到各 agent 的 model.primary
-  // 子 Agent 的模型覆盖是 OpenClaw 正常功能（用户可通过对话为不同 Agent 设置不同模型）
-  // 强制覆盖会导致 #142：重开 ClawPanel 后子 Agent 模型配置被重置
+  // Note: no longer forcing sync to agents.list model.primary
+  // Per-agent model overrides are normal OpenClaw behavior
 }
 
 // 顶部按钮事件
